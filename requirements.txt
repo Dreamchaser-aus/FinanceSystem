@@ -1,0 +1,7 @@
+Flask>=3.0,<4
+Flask-SQLAlchemy>=3.1,<4
+Flask-Login>=0.6,<1
+Flask-WTF>=1.2,<2
+psycopg[binary]>=3.2,<4
+gunicorn>=22,<25
+python-dotenv>=1,<2

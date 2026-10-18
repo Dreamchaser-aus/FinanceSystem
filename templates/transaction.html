@@ -1,31 +1,14 @@
 {% extends 'base.html' %}{% block content %}
-<h3>New Transaction</h3><div class="card p-4" style="max-width:800px"><form method="post" id="txn">
-<input type="hidden" name="csrf_token" value="{{csrf_token()}}"><div class="row g-3">
-<div class="col-md-6"><label class="form-label">Transaction Type</label><select class="form-select" name="kind" id="kind">
-<option value="deposit">Customer Deposit — Bank Received</option><option value="withdrawal">Customer Withdrawal — Bank Paid</option>
-<option value="dealer_payout">Customer Withdrawal — Dealer Paid</option><option value="dealer_sell">Sell AUD — Bank to Dealer</option>
-<option value="dealer_buy">Buy AUD — Dealer to Bank</option><option value="transfer">Bank to Bank Transfer</option></select></div>
-<div class="col-md-6"><label class="form-label">Amount (AUD)</label><input class="form-control" id="amount" name="amount" type="number" step="0.01" min="0.01" required></div>
-<div class="col-md-6" id="bankBox"><label class="form-label" id="bankLabel">Bank Account</label><select class="form-select" name="bank_id" id="bank"><option value="">Select bank</option>{% for b in banks %}<option value="{{b.id}}">{{b.name}}</option>{% endfor %}</select></div>
-<div class="col-md-6" id="destination" hidden><label class="form-label">Destination Bank</label><select class="form-select" name="to_bank_id" id="toBank"><option value="">Select destination</option>{% for b in banks %}<option value="{{b.id}}">{{b.name}}</option>{% endfor %}</select></div>
-<div class="col-md-6" id="dealerBox" hidden><label class="form-label">Exchange Dealer</label><select class="form-select" name="dealer_id" id="dealer"><option value="">Select dealer</option>{% for d in dealers %}<option value="{{d.id}}">{{d.name}}</option>{% endfor %}</select><small class="text-muted">Admin adds dealers on the Dealer Accounts page.</small></div>
-<div class="col-md-6" id="rateBox" hidden><label class="form-label">Agreed Rate (MYR / AUD)</label><input class="form-control" name="rate" id="rate" type="number" step="0.000001" min="0.000001"></div>
-<div class="col-md-6"><label class="form-label">Transaction ID (unique)</label><input class="form-control" name="reference" required maxlength="120"></div>
-<div class="col-md-6" id="customerBox"><label class="form-label">Customer ID</label><input class="form-control" name="customer_ref" id="customer" maxlength="120"></div>
-<div class="col-12"><label class="form-label">Remark / Bank Payment Reference</label><textarea class="form-control" name="remark" rows="2"></textarea></div>
-</div><div class="alert alert-info mt-3" id="impact" aria-live="polite"></div><button class="btn btn-primary" id="submitBtn">Confirm Transaction</button>
-<p class="text-muted small mt-3 mb-0">Submit only after the actual AUD transfer or dealer payout is completed. All amounts are AUD except the calculated dealer MYR obligation. One submission posts the linked records atomically.</p></form></div>
-<script>
-const $=id=>document.getElementById(id),kind=$('kind'),amount=$('amount'),rate=$('rate');
-function update(){const k=kind.value,fx=k.startsWith('dealer_'),payout=k==='dealer_payout',transfer=k==='transfer',customer=['deposit','withdrawal','dealer_payout'].includes(k);
-$('bankBox').hidden=payout;$('bank').required=!payout;if(payout)$('bank').value='';
-$('destination').hidden=!transfer;$('toBank').required=transfer;if(!transfer)$('toBank').value='';
-$('dealerBox').hidden=!fx;$('dealer').required=fx;$('rateBox').hidden=!fx;rate.required=fx;
-$('customerBox').hidden=!customer;$('customer').required=payout;
-$('bankLabel').textContent=['deposit','dealer_buy'].includes(k)?'Receiving Bank':'Source Bank';
-const a=Number(amount.value)||0,r=Number(rate.value)||0;
-const move=payout?'No bank movement':k==='deposit'||k==='dealer_buy'?`Bank +AUD ${a.toFixed(2)}`:transfer?`Source −AUD ${a.toFixed(2)}, Destination +AUD ${a.toFixed(2)}`:`Bank −AUD ${a.toFixed(2)}`;
-$('impact').textContent=move+(fx?` | ${k==='dealer_sell'?'Dealer owes you':'You owe Dealer'} MYR ${(a*r).toFixed(2)}`:'')+(payout?' | Counts as customer withdrawal':'');}
-[kind,amount,rate].forEach(e=>e.addEventListener('input',update));update();
-$('txn').addEventListener('submit',e=>{if(kind.value==='transfer'&&$('bank').value===$('toBank').value){e.preventDefault();alert('Choose different banks');return}if(!confirm('Confirm actual payment completed and post this transaction?')){e.preventDefault();return}$('submitBtn').disabled=true});
-</script>{% endblock %}
+<div class="d-flex justify-content-between align-items-center mb-3"><h3>Edit Transaction</h3><a class="btn btn-outline-secondary" href="{{url_for('transactions')}}">Back</a></div>
+<div class="alert alert-warning">Editing a transaction recalculates bank balances. Transactions on closed business dates or involving banks already closed for the day cannot be edited.</div>
+<div class="card p-3"><form method="post"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><div class="row g-3">
+<div class="col-md-4"><label class="form-label">Type</label><select class="form-select" name="kind" id="kind" onchange="toggleTransfer()" required>{% for v in ['deposit','withdrawal','transfer'] %}<option value="{{v}}" {% if t.kind==v %}selected{% endif %}>{{v|title}}</option>{% endfor %}</select></div>
+<div class="col-md-4"><label class="form-label">Transaction ID</label><input class="form-control" name="reference" value="{{t.reference}}" maxlength="120" required></div>
+<div class="col-md-4"><label class="form-label">Amount (RM)</label><input class="form-control" type="number" step="0.01" min="0.01" name="amount" value="{{t.signed_amount|abs}}" required></div>
+<div class="col-md-6"><label class="form-label">Bank Account (Deposit / Withdrawal / From)</label><select class="form-select" name="bank_id" required>{% for b in banks %}<option value="{{b.id}}" {% if b.id==source_id %}selected{% endif %}>{{b.name}} — {{b.status}}</option>{% endfor %}</select></div>
+<div class="col-md-6" id="destination"><label class="form-label">To Bank (Transfer)</label><select class="form-select" name="to_bank_id"><option value="">Choose bank</option>{% for b in banks %}<option value="{{b.id}}" {% if b.id==destination_id %}selected{% endif %}>{{b.name}} — {{b.status}}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">Customer Name</label><input class="form-control" name="customer_ref" value="{{t.customer_ref or ''}}" maxlength="120"></div>
+<div class="col-12"><label class="form-label">Remark</label><textarea class="form-control" name="remark" maxlength="2000" rows="3">{{t.remark or ''}}</textarea></div>
+<div class="col-12"><button class="btn btn-primary" onclick="return confirm('Save changes and recalculate balances?')">Save Changes</button></div></div></form></div>
+<script>function toggleTransfer(){document.getElementById('destination').style.display=document.getElementById('kind').value==='transfer'?'':'none'}toggleTransfer();</script>
+{% endblock %}

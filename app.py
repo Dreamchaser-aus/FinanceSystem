@@ -122,12 +122,12 @@ def role_required(*roles):
     return outer
 
 def balances():
-    rows=db.session.execute(select(Entry.bank_id,func.coalesce(func.sum(Entry.delta),0)).group_by(Entry.bank_id)).all()
+    rows=db.session.execute(select(Entry.bank_id,func.coalesce(func.sum(Entry.delta),0)).join(Transaction, Entry.transaction_id==Transaction.id).where(Transaction.status=='confirmed').group_by(Entry.bank_id)).all()
     changes=dict(rows)
     return {b.id:money(b.opening_balance)+money(changes.get(b.id,0)) for b in Bank.query.all()}
 
 def ledger_balance(bank_id,through=None):
-    q=select(func.coalesce(func.sum(Entry.delta),0)).where(Entry.bank_id==bank_id).join(Transaction,Entry.transaction_id==Transaction.id)
+    q=select(func.coalesce(func.sum(Entry.delta),0)).where(Entry.bank_id==bank_id).join(Transaction,Entry.transaction_id==Transaction.id).where(Transaction.status=='confirmed')
     if through is not None: q=q.where(Transaction.business_date<=through)
     bank=db.session.get(Bank,bank_id)
     return money(bank.opening_balance)+money(db.session.execute(q).scalar_one())
@@ -239,11 +239,15 @@ def create_app(test_config=None):
     @app.get('/')
     @login_required
     def dashboard():
-        bs=Bank.query.order_by(Bank.kind,Bank.name).all();bal=balances()
+        bank_page=max(1,request.args.get('bank_page',1,type=int))
+        active_query=Bank.query.filter(Bank.active.is_(True),Bank.status=='active').order_by(Bank.kind,Bank.name)
+        active_total=active_query.all()
+        bank_pagination=active_query.paginate(page=bank_page,per_page=10,error_out=False)
+        bs=bank_pagination.items;bal=balances()
         today=business_today()
-        rows=db.session.execute(select(Transaction.kind,func.count(Transaction.id),func.coalesce(func.sum(Transaction.signed_amount),0)).where(Transaction.business_date==today).group_by(Transaction.kind)).all()
+        rows=db.session.execute(select(Transaction.kind,func.count(Transaction.id),func.coalesce(func.sum(Transaction.signed_amount),0)).where(Transaction.business_date==today,Transaction.status=='confirmed').group_by(Transaction.kind)).all()
         totals={k:{'count':n,'amount':money(v)} for k,n,v in rows}
-        latest=Transaction.query.order_by(Transaction.created_at.desc()).limit(12).all()
+        latest=Transaction.query.filter_by(status='confirmed').order_by(Transaction.created_at.desc(),Transaction.id.desc()).limit(20).all()
         transaction_banks = {}
         latest_ids = [t.id for t in latest]
         if latest_ids:
@@ -266,7 +270,7 @@ def create_app(test_config=None):
         return render_template(
             'dashboard.html', banks=bs, balances=bal, totals=totals,
             latest=latest, transaction_banks=transaction_banks,
-            grand=sum(bal.values(), Decimal('0'))
+            grand=sum((bal[b.id] for b in active_total),Decimal('0')),page_total=sum((bal[b.id] for b in bs),Decimal('0')),bank_pagination=bank_pagination
         )
 
     @app.route('/banks',methods=['GET','POST'])
@@ -284,8 +288,12 @@ def create_app(test_config=None):
                 db.session.commit();flash('Bank created','success')
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('banks'))
-        return render_template('banks.html',banks=Bank.query.order_by(Bank.kind,Bank.name).all(),balances=balances(),
-                               statuses=BANK_STATUSES, history=BankStatusHistory.query.order_by(BankStatusHistory.created_at.desc()).limit(30).all())
+        bank_page=max(1,request.args.get('bank_page',1,type=int))
+        history_page=max(1,request.args.get('history_page',1,type=int))
+        bank_pagination=Bank.query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
+        history_pagination=BankStatusHistory.query.order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
+        return render_template('banks.html',banks=bank_pagination.items,balances=balances(),
+                               statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination)
 
     @app.post('/banks/<bank_id>/status')
     @role_required('admin','staff')
@@ -366,7 +374,7 @@ def create_app(test_config=None):
 
         page = max(1, request.args.get('page', 1, type=int))
         records = q.order_by(Transaction.created_at.desc(), Transaction.id.desc()).paginate(
-            page=page, per_page=30, error_out=False
+            page=page, per_page=20, error_out=False
         )
         ids = [t.id for t in records.items]
         transaction_banks = {}
@@ -393,6 +401,101 @@ def create_app(test_config=None):
                                banks=Bank.query.order_by(Bank.name).all(),
                                search=search, kind=kind, bank_id=bank_id)
 
+    @app.route('/transactions/<transaction_id>/edit', methods=['GET','POST'])
+    @role_required('admin','staff')
+    def edit_transaction(transaction_id):
+        t=db.session.get(Transaction,transaction_id)
+        if not t: abort(404)
+        if request.method=='GET':
+            if t.status!='confirmed':
+                flash('Voided transactions cannot be edited','warning')
+                return redirect(url_for('transactions'))
+            entries=Entry.query.filter_by(transaction_id=t.id).all()
+            source=next((e for e in entries if e.delta<0),None) if t.kind=='transfer' else (entries[0] if entries else None)
+            destination=next((e for e in entries if e.delta>0),None) if t.kind=='transfer' else None
+            return render_template('transaction_edit.html',t=t,banks=Bank.query.order_by(Bank.name).all(),source_id=source.bank_id if source else '',destination_id=destination.bank_id if destination else '')
+        try:
+            # Serialize all edits/deletes of the same transaction.
+            t=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
+            if not t: abort(404)
+            if t.status!='confirmed': raise ValueError('Transaction already voided')
+            if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be edited')
+            kind=request.form.get('kind','').strip()
+            if kind not in ('deposit','withdrawal','transfer'): raise ValueError('Invalid type')
+            reference=request.form.get('reference','').strip()
+            if not reference: raise ValueError('Transaction ID required')
+            amount=amount_positive(request.form.get('amount',''))
+            bank_id=request.form.get('bank_id','').strip()
+            to_bank_id=request.form.get('to_bank_id','').strip() if kind=='transfer' else ''
+            if kind=='transfer' and (not to_bank_id or to_bank_id==bank_id): raise ValueError('Choose two different banks')
+            old_entries=Entry.query.filter_by(transaction_id=t.id).all()
+            old_ids={e.bank_id for e in old_entries}
+            new_ids={bank_id}|({to_bank_id} if to_bank_id else set())
+            affected=old_ids|new_ids
+            locked=lock_banks(affected)
+            if len(locked)!=len(affected): raise ValueError('Bank not found')
+            if Closing.query.filter(Closing.bank_id.in_(affected),Closing.business_date==t.business_date).first():
+                raise ValueError('Cannot edit: an affected bank has been closed for this business date')
+            banks_by_id={b.id:b for b in locked}
+            for bid in new_ids:
+                b=banks_by_id[bid]
+                if not b.active: raise ValueError(f'{b.name} is inactive')
+                if b.status=='active': continue
+                if b.status=='cannot_transfer' and ((kind=='deposit' and bid==bank_id) or (kind=='transfer' and bid==to_bank_id)): continue
+                raise ValueError(f'{b.name} status does not permit this transaction')
+            duplicate=Transaction.query.filter(Transaction.reference==reference,Transaction.id!=t.id).first()
+            if duplicate: raise ValueError('Duplicate Transaction ID')
+            new_deltas={bank_id:amount if kind=='deposit' else -amount}
+            if kind=='transfer': new_deltas[to_bank_id]=amount
+            old_deltas={}
+            for e in old_entries: old_deltas[e.bank_id]=old_deltas.get(e.bank_id,Decimal('0'))+money(e.delta)
+            for bid in affected:
+                projected=ledger_balance(bid)-old_deltas.get(bid,Decimal('0'))+new_deltas.get(bid,Decimal('0'))
+                if projected<0: raise ValueError(f'Insufficient balance after edit: {banks_by_id[bid].name}')
+            before=f'{t.reference} {t.kind} {t.signed_amount} entries={[(e.bank_id,str(e.delta)) for e in old_entries]}'
+            for e in old_entries: db.session.delete(e)
+            db.session.flush()
+            for bid,delta in new_deltas.items(): db.session.add(Entry(transaction_id=t.id,bank_id=bid,delta=delta))
+            t.reference=reference;t.kind=kind;t.signed_amount=amount if kind=='deposit' else -amount
+            t.customer_ref=request.form.get('customer_ref','').strip()[:120] or None
+            t.remark=request.form.get('remark','').strip()[:2000]
+            db.session.add(Audit(actor_id=current_user.id,action='EDIT_TRANSACTION',detail=f'{t.id} BEFORE {before} AFTER {reference} {kind} {amount} entries={[(k,str(v)) for k,v in new_deltas.items()]}'))
+            db.session.commit()
+            flash('Transaction updated and balances recalculated','success')
+            return redirect(url_for('transactions'))
+        except (ValueError,IntegrityError) as e:
+            db.session.rollback();flash(str(e),'danger')
+            return redirect(url_for('edit_transaction',transaction_id=transaction_id))
+
+    @app.post('/transactions/<transaction_id>/delete')
+    @role_required('admin','staff')
+    def delete_transaction(transaction_id):
+        reason=request.form.get('reason','').strip()
+        if len(reason)<5: flash('Deletion reason must contain at least 5 characters','danger');return redirect(url_for('transactions'))
+        try:
+            t=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
+            if not t: abort(404)
+            if t.status!='confirmed': raise ValueError('Transaction already voided')
+            if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be voided')
+            entries=Entry.query.filter_by(transaction_id=t.id).all()
+            affected={e.bank_id for e in entries}
+            banks=lock_banks(affected)
+            if Closing.query.filter(Closing.bank_id.in_(affected),Closing.business_date==t.business_date).first():
+                raise ValueError('Cannot delete: an affected bank has been closed for this business date')
+            # Removing a credit must not create a negative bank balance.
+            by_bank={}
+            for e in entries: by_bank[e.bank_id]=by_bank.get(e.bank_id,Decimal('0'))+money(e.delta)
+            for b in banks:
+                if ledger_balance(b.id)-by_bank.get(b.id,Decimal('0'))<0:
+                    raise ValueError(f'Cannot void: {b.name} would have a negative balance')
+            t.status='voided'
+            db.session.add(Audit(actor_id=current_user.id,action='VOID_TRANSACTION',detail=f'{t.id} {t.reference}; reason={reason[:500]}'))
+            db.session.commit()
+            flash('Transaction voided; balances recalculated. History preserved.','success')
+        except (ValueError,IntegrityError) as e:
+            db.session.rollback();flash(str(e),'danger')
+        return redirect(url_for('transactions'))
+
     @app.route('/closing',methods=['GET','POST'])
     @role_required('admin','finance')
     def closing():
@@ -409,8 +512,10 @@ def create_app(test_config=None):
                 db.session.commit();flash('Bank closed for today','success')
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('closing'))
-        closes=Closing.query.filter_by(business_date=today).all()
-        return render_template('closing.html',banks=Bank.query.order_by(Bank.name).all(),balances=balances(),closes=closes,closed_ids={c.bank_id for c in closes})
+        closes_all=Closing.query.filter_by(business_date=today).all()
+        close_page=max(1,request.args.get('page',1,type=int))
+        close_pagination=Closing.query.filter_by(business_date=today).order_by(Closing.created_at.desc(),Closing.id.desc()).paginate(page=close_page,per_page=15,error_out=False)
+        return render_template('closing.html',banks=Bank.query.order_by(Bank.name).all(),balances=balances(),closes=close_pagination.items,close_pagination=close_pagination,closed_ids={c.bank_id for c in closes_all})
 
     @app.get('/health')
     def health(): return {'status':'ok'}

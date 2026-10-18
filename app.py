@@ -147,6 +147,23 @@ def selected_date():
         abort(400, description='Future reporting dates are not supported')
     return day
 
+def selected_range():
+    """Dashboard only: inclusive MYT date range, max 366 days."""
+    today = business_today()
+    raw_start = request.args.get('start_date', '').strip()
+    raw_end = request.args.get('end_date', '').strip()
+    if not raw_start and not raw_end:
+        single = selected_date()
+        return single, single
+    try:
+        start = date.fromisoformat(raw_start or raw_end)
+        end = date.fromisoformat(raw_end or raw_start)
+    except ValueError:
+        abort(400, description='Invalid start/end date')
+    if start > end or end > today or (end - start).days > 365:
+        abort(400, description='Date range must be ordered, not future, and at most 366 days')
+    return start, end
+
 def bank_status_on(bank, day, history_by_bank):
     """Reconstruct status at end of MYT day from append-only history.
 
@@ -277,7 +294,7 @@ def create_app(test_config=None):
     @app.get('/')
     @login_required
     def dashboard():
-        day = selected_date()
+        start_day, day = selected_range()
         bank_page = max(1, request.args.get('bank_page', 1, type=int))
         close_page = max(1, request.args.get('close_page', 1, type=int))
         all_banks = Bank.query.order_by(Bank.kind, Bank.name).all()
@@ -301,10 +318,10 @@ def create_app(test_config=None):
         bank_items = active_banks[(bank_page-1)*10:bank_page*10]
         rows = db.session.execute(
             select(Transaction.kind, func.count(Transaction.id), func.coalesce(func.sum(Transaction.signed_amount), 0))
-            .where(Transaction.business_date == day, Transaction.status == 'confirmed')
+            .where(Transaction.business_date.between(start_day, day), Transaction.status == 'confirmed')
             .group_by(Transaction.kind)).all()
         totals = {k: {'count': n, 'amount': money(v)} for k, n, v in rows}
-        latest = (Transaction.query.filter_by(status='confirmed', business_date=day)
+        latest = (Transaction.query.filter(Transaction.status=='confirmed', Transaction.business_date.between(start_day, day))
                   .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
         transaction_banks = {}
         ids = [t.id for t in latest]
@@ -324,11 +341,32 @@ def create_app(test_config=None):
                     transaction_banks[t.id] = f'{source} → {dest}'
                 else:
                     transaction_banks[t.id] = items[0][1] if items else 'Unknown'
-        closed_query = (Closing.query.filter_by(business_date=day)
+        closed_query = (Closing.query.filter(Closing.business_date.between(start_day, day))
                         .order_by(Closing.created_at.desc(), Closing.id.desc()))
         closed_page = closed_query.paginate(page=close_page, per_page=10, error_out=False)
+        # A customer is identified by normalized customer_ref (customer ID).
+        # Active = distinct IDs with confirmed deposit/withdrawal in selected range.
+        # New = active IDs whose first ever confirmed deposit/withdrawal is in range.
+        activity_filter = (Transaction.status == 'confirmed',
+                           Transaction.kind.in_(['deposit', 'withdrawal']),
+                           Transaction.customer_ref.isnot(None),
+                           func.length(func.trim(Transaction.customer_ref)) > 0)
+        normalized_id = func.lower(func.trim(Transaction.customer_ref))
+        active_ids = set(db.session.execute(
+            select(normalized_id).where(*activity_filter,
+                Transaction.business_date.between(start_day, day)).distinct()
+        ).scalars().all())
+        first_seen = db.session.execute(
+            select(normalized_id, func.min(Transaction.business_date))
+            .where(*activity_filter).group_by(normalized_id)
+        ).all()
+        first_dates = dict(first_seen)
+        new_count = sum(1 for customer_id in active_ids
+                        if start_day <= first_dates[customer_id] <= day)
         return render_template(
-            'dashboard.html', selected_day=day, banks=bank_items, balances=bal,
+            'dashboard.html', selected_day=day, start_day=start_day,
+            active_customers=len(active_ids), new_customers=new_count,
+            banks=bank_items, balances=bal,
             totals=totals, latest=latest, transaction_banks=transaction_banks,
             grand=active_total, page_total=sum((bal[b.id] for b in bank_items), Decimal('0')),
             bank_page=bank_page, bank_pages=bank_pages, active_count=len(active_banks),
@@ -417,7 +455,9 @@ def create_app(test_config=None):
         day = selected_date()
         q = Transaction.query.filter(Transaction.business_date == day)
         search = request.args.get('search', '').strip()
-        kind = request.args.get('kind', 'all').strip().lower()
+        kinds = [v for v in request.args.getlist('kind')
+                 if v in ('deposit', 'withdrawal', 'transfer')]
+        kinds = list(dict.fromkeys(kinds))
         bank_id = request.args.get('bank_id', '').strip()
 
         if search:
@@ -431,8 +471,8 @@ def create_app(test_config=None):
                 Transaction.reference.ilike(pattern),
                 Transaction.id.in_(matching_transaction_ids)
             ))
-        if kind in ('deposit', 'withdrawal', 'transfer'):
-            q = q.filter(Transaction.kind == kind)
+        if kinds:
+            q = q.filter(Transaction.kind.in_(kinds))
         if bank_id:
             q = q.filter(Transaction.id.in_(
                 select(Entry.transaction_id).where(Entry.bank_id == bank_id)
@@ -465,7 +505,7 @@ def create_app(test_config=None):
         return render_template('transactions.html', records=records,
                                transaction_banks=transaction_banks,
                                banks=Bank.query.order_by(Bank.name).all(),
-                               search=search, kind=kind, bank_id=bank_id, selected_day=day)
+                               search=search, kinds=kinds, bank_id=bank_id, selected_day=day)
 
     @app.route('/transactions/<transaction_id>/edit', methods=['GET','POST'])
     @role_required('admin','staff')

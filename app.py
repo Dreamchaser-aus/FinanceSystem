@@ -424,8 +424,24 @@ def create_app(test_config=None):
         first_dates = dict(first_seen)
         new_count = sum(1 for customer_id in active_ids
                         if start_day <= first_dates[customer_id] <= day)
+        dealer_items = Dealer.query.order_by(Dealer.name).all()
+        dealer_rows = db.session.execute(
+            select(DealerTrade.dealer_id, DealerTrade.flow,
+                   func.sum(DealerTrade.aud_amount), func.sum(DealerTrade.myr_delta))
+            .join(Transaction, Transaction.id == DealerTrade.transaction_id)
+            .where(Transaction.status == 'confirmed')
+            .group_by(DealerTrade.dealer_id, DealerTrade.flow)
+        ).all()
+        dealer_totals = {}
+        for did, flow, aud, myr_delta in dealer_rows:
+            item = dealer_totals.setdefault(did, {
+                'dealer_sell': Decimal('0'), 'dealer_buy': Decimal('0'),
+                'dealer_payout': Decimal('0'), 'myr': Decimal('0')})
+            item[flow] = money(aud)
+            item['myr'] += money(myr_delta)
         return render_template(
             'dashboard.html', selected_day=day, start_day=start_day,
+            dealer_items=dealer_items, dealer_totals=dealer_totals,
             active_customers=len(active_ids), new_customers=new_count,
             banks=bank_items, balances=bal,
             totals=totals, latest=latest, transaction_banks=transaction_banks,
@@ -511,7 +527,7 @@ def create_app(test_config=None):
                     db.session.add(Dealer(name=name));db.session.commit();flash('Dealer added','success')
                 except IntegrityError:
                     db.session.rollback();flash('Dealer already exists','danger')
-            return redirect(url_for('dealers'))
+            return redirect(url_for('banks') + '#add-dealer')
         items=Dealer.query.order_by(Dealer.name).all()
         rows=db.session.execute(select(DealerTrade.dealer_id,DealerTrade.flow,func.sum(DealerTrade.aud_amount),func.sum(DealerTrade.myr_delta)).join(Transaction,Transaction.id==DealerTrade.transaction_id).where(Transaction.status=='confirmed').group_by(DealerTrade.dealer_id,DealerTrade.flow)).all()
         totals={}

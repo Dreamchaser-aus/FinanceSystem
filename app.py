@@ -44,7 +44,32 @@ class Bank(db.Model):
     kind=db.Column(db.String(20),nullable=False,default='deposit')
     opening_balance=db.Column(db.Numeric(18,2),nullable=False,default=0)
     active=db.Column(db.Boolean,nullable=False,default=True)
+    status=db.Column(db.String(30),nullable=False,default='active')
+    status_remark=db.Column(db.Text)
+    status_updated_at=db.Column(db.DateTime(timezone=True))
+    status_updated_by=db.Column(db.String(36),db.ForeignKey('user.id'))
     created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+
+class BankStatusHistory(db.Model):
+    __tablename__='bank_status_history'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
+    actor_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
+    old_status=db.Column(db.String(30),nullable=False)
+    new_status=db.Column(db.String(30),nullable=False)
+    remark=db.Column(db.Text)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+    bank=db.relationship('Bank')
+    actor=db.relationship('User')
+
+BANK_STATUSES={
+    'active':'Active',
+    'cannot_transfer':'Cannot Transfer',
+    'login_failed':'Login Failed',
+    'wrong_password':'Wrong Password',
+    'closed':'Closed',
+    'other_issue':'Other Issue',
+}
 
 class Transaction(db.Model):
     id=db.Column(db.String(36),primary_key=True,default=idgen)
@@ -127,6 +152,17 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
     try:
         bs=lock_banks(ids)
         if len(bs)!=len(ids) or any(not b.active for b in bs): raise ValueError('Bank missing or inactive')
+        # A bank marked cannot_transfer may receive funds but cannot send funds.
+        # All other non-active states block new movements in either direction.
+        for b in bs:
+            is_source = b.id == bank_id
+            if b.status == 'active':
+                continue
+            if b.status == 'cannot_transfer' and not is_source and kind == 'transfer':
+                continue
+            if b.status == 'cannot_transfer' and is_source and kind == 'deposit':
+                continue
+            raise ValueError(f'Bank {b.name} status is {BANK_STATUSES.get(b.status,b.status)}; this transaction is not permitted')
         check_open_day(day,ids)
         if Transaction.query.filter_by(reference=reference.strip()).first(): raise ValueError('Duplicate Transaction ID')
         delta=a if kind=='deposit' else -a
@@ -248,7 +284,48 @@ def create_app(test_config=None):
                 db.session.commit();flash('Bank created','success')
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('banks'))
-        return render_template('banks.html',banks=Bank.query.order_by(Bank.kind,Bank.name).all(),balances=balances())
+        return render_template('banks.html',banks=Bank.query.order_by(Bank.kind,Bank.name).all(),balances=balances(),
+                               statuses=BANK_STATUSES, history=BankStatusHistory.query.order_by(BankStatusHistory.created_at.desc()).limit(30).all())
+
+    @app.post('/banks/<bank_id>/status')
+    @role_required('admin','staff')
+    def update_bank_status(bank_id):
+        new_status=request.form.get('status','').strip()
+        remark=request.form.get('remark','').strip()
+        if new_status not in BANK_STATUSES:
+            flash('Invalid bank status','danger')
+            return redirect(url_for('banks'))
+        if len(remark)>2000:
+            flash('Remark must be 2000 characters or fewer','danger')
+            return redirect(url_for('banks'))
+        if new_status!='active' and not remark:
+            flash('A reason is required when reporting a bank issue','danger')
+            return redirect(url_for('banks'))
+        try:
+            locked=lock_banks([bank_id])
+            if len(locked)!=1: abort(404)
+            bank=locked[0]
+            old_status=bank.status
+            if old_status==new_status and (bank.status_remark or '')==remark:
+                db.session.rollback()
+                flash('No changes to save','info')
+                return redirect(url_for('banks'))
+            bank.status=new_status
+            bank.status_remark=remark or None
+            bank.status_updated_at=now()
+            bank.status_updated_by=current_user.id
+            # Legacy active flag stays synchronized for older code paths.
+            bank.active=(new_status!='closed')
+            db.session.add(BankStatusHistory(bank_id=bank.id,actor_id=current_user.id,
+                                             old_status=old_status,new_status=new_status,remark=remark or None))
+            db.session.add(Audit(actor_id=current_user.id,action='UPDATE_BANK_STATUS',
+                                 detail=f'{bank.id}: {old_status} -> {new_status}; reason={remark[:500]}'))
+            db.session.commit()
+            flash(f'{bank.name} status updated to {BANK_STATUSES[new_status]}','success')
+        except Exception:
+            db.session.rollback()
+            raise
+        return redirect(url_for('banks'))
 
     @app.route('/transactions/new',methods=['GET','POST'])
     @login_required

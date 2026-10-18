@@ -21,20 +21,20 @@
   </form>
   <div class="table-responsive">
     <table class="table table-hover align-middle">
-      <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th class="text-end">Amount</th></tr></thead>
+      <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th class="text-end">Amount</th><th>Actions</th></tr></thead>
       <tbody>
       {% for t in records.items %}
         <tr>
-          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} MYT</div></td>
+          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} MYT</div>{% if t.status=='voided' %}<span class="badge bg-secondary">Voided</span>{% endif %}</td>
           <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
             {% if t.kind == 'deposit' %}<span class="badge bg-success">Deposit</span>
             {% elif t.kind == 'withdrawal' %}<span class="badge bg-danger">Withdrawal</span>
             {% else %}<span class="badge bg-primary">Transfer</span>{% endif %}
           </td>
-          <td class="text-end money text-nowrap fw-semibold {{ 'text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '') }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}RM {{ t.signed_amount|abs|rm }}</td>
+          <td class="text-end money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '')) }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}RM {{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and current_user.role in ('admin','staff') %}<div class="d-flex gap-1 flex-wrap"><a class="btn btn-sm btn-outline-primary" href="{{url_for('edit_transaction',transaction_id=t.id)}}">Edit</a><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
         </tr>
       {% else %}
-        <tr><td colspan="3" class="text-center text-muted py-4">No matching transactions</td></tr>
+        <tr><td colspan="4" class="text-center text-muted py-4">No matching transactions</td></tr>
       {% endfor %}
       </tbody>
     </table>

@@ -1,1 +1,161 @@
-{% extends 'base.html' %}{% block content %}<div class="d-flex justify-content-between flex-wrap align-items-center"><h3>Financial Dashboard</h3><a class="btn btn-primary" href="{{url_for('new_transaction')}}">+ New Transaction</a></div><div class="row g-3 my-2"><div class="col-6 col-lg-3"><div class="card p-3"><small>Total Bank Balance</small><h4 class="money">RM {{grand|rm}}</h4></div></div>{% for key,title in [('deposit','Today Deposit'),('withdrawal','Today Withdrawal'),('transfer','Today Transfers')] %}<div class="col-6 col-lg-3"><div class="card p-3"><small>{{title}}</small><h4 class="money">RM {{totals.get(key,{}).get('amount',0)|abs|rm}}</h4><small>{{totals.get(key,{}).get('count',0)}} records</small></div></div>{% endfor %}</div><div class="card p-3 mt-3"><h5>Bank Balances</h5><div class="table-responsive"><table class="table table-hover align-middle"><thead><tr><th>Bank</th><th>Group</th><th class="text-end">Balance (NOW)</th><th>Status</th></tr></thead><tbody>{% for b in banks %}<tr><td>{{b.name}}</td><td>{{b.kind}}</td><td class="text-end money {% if balances[b.id]<0 %}text-danger{% endif %}">RM {{balances[b.id]|rm}}</td><td>{{'Active' if b.active else 'Inactive'}}</td></tr>{% endfor %}</tbody></table></div></div><div class="card p-3 mt-3"><h5>Latest Transactions</h5><div class="table-responsive"><table class="table table-sm"><thead><tr><th>Time (MYT)</th><th>Reference</th><th>Type</th><th class="text-end">Signed Amount</th></tr></thead><tbody>{% for t in latest %}<tr><td>{{t.created_at|mytime}}</td><td>{{t.reference}}</td><td>{{t.kind}}</td><td class="text-end money">{{t.signed_amount|rm}}</td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}
+
+{% extends 'base.html' %}
+{% block content %}
+
+<div class="d-flex justify-content-between flex-wrap align-items-center gap-2">
+    <h3>Financial Dashboard</h3>
+    <a class="btn btn-primary" href="{{ url_for('new_transaction') }}">
+        + New Transaction
+    </a>
+</div>
+
+<div class="row g-3 my-2">
+    <div class="col-6 col-lg-3">
+        <div class="card p-3 h-100">
+            <small>Total Bank Balance</small>
+            <h4 class="money">RM {{ grand|rm }}</h4>
+        </div>
+    </div>
+
+    {% for key, title in [
+        ('deposit', 'Today Deposit'),
+        ('withdrawal', 'Today Withdrawal'),
+        ('transfer', 'Today Transfers')
+    ] %}
+    <div class="col-6 col-lg-3">
+        <div class="card p-3 h-100">
+            <small>{{ title }}</small>
+            <h4 class="money">
+                RM {{ totals.get(key, {}).get('amount', 0)|abs|rm }}
+            </h4>
+            <small>
+                {{ totals.get(key, {}).get('count', 0) }} records
+            </small>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<div class="card p-3 mt-3">
+    <h5>Bank Balances</h5>
+
+    <div class="table-responsive">
+        <table class="table table-hover align-middle">
+            <thead>
+                <tr>
+                    <th>Bank</th>
+                    <th>Group</th>
+                    <th class="text-end">Balance (NOW)</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for b in banks %}
+                <tr>
+                    <td>{{ b.name }}</td>
+                    <td>{{ b.kind|title }}</td>
+                    <td class="text-end money {% if balances[b.id] < 0 %}text-danger{% endif %}">
+                        RM {{ balances[b.id]|rm }}
+                    </td>
+                    <td>
+                        {{ 'Active' if b.active else 'Inactive' }}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="4" class="text-center text-muted">
+                        No bank accounts found
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card p-3 mt-3">
+    <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Latest Transactions</h5>
+        <a href="{{ url_for('transactions') }}"
+           class="btn btn-sm btn-outline-primary">
+            View All
+        </a>
+    </div>
+
+    <div class="table-responsive mt-3">
+        <table class="table table-hover table-sm align-middle">
+            <thead class="table-light">
+                <tr>
+                    <th>Time (MYT)</th>
+                    <th>Customer Name</th>
+                    <th>Transaction ID</th>
+                    <th>Type</th>
+                    <th>Bank Account</th>
+                    <th class="text-end">Amount (RM)</th>
+                </tr>
+            </thead>
+
+            <tbody>
+                {% for t in latest %}
+                <tr>
+                    <td class="text-nowrap">
+                        {{ t.created_at|mytime }}
+                    </td>
+
+                    <td>
+                        {{ t.customer_ref or '-' }}
+                    </td>
+
+                    <td>
+                        <span class="font-monospace">
+                            {{ t.reference }}
+                        </span>
+                    </td>
+
+                    <td>
+                        {% if t.kind == 'deposit' %}
+                            <span class="badge bg-success">
+                                Deposit
+                            </span>
+                        {% elif t.kind == 'withdrawal' %}
+                            <span class="badge bg-danger">
+                                Withdrawal
+                            </span>
+                        {% else %}
+                            <span class="badge bg-primary">
+                                Transfer
+                            </span>
+                        {% endif %}
+                    </td>
+
+                    <td>
+                        {{ transaction_banks.get(t.id, 'Unknown') }}
+                    </td>
+
+                    <td class="text-end money text-nowrap">
+                        {% if t.kind == 'deposit' %}
+                            <span class="text-success">
+                                +RM {{ t.signed_amount|abs|rm }}
+                            </span>
+                        {% elif t.kind == 'withdrawal' %}
+                            <span class="text-danger">
+                                -RM {{ t.signed_amount|abs|rm }}
+                            </span>
+                        {% else %}
+                            RM {{ t.signed_amount|abs|rm }}
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="6" class="text-center text-muted py-4">
+                        No transactions found
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+{% endblock %}

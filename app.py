@@ -1,3 +1,67 @@
+import os, uuid
+from datetime import datetime, timezone, date, timedelta
+from decimal import Decimal, InvalidOperation
+from functools import wraps
+from zoneinfo import ZoneInfo
+from flask import Flask, render_template, redirect, url_for, flash, request, abort
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_wtf.csrf import CSRFProtect
+from sqlalchemy import func, select, UniqueConstraint
+from sqlalchemy.exc import IntegrityError
+from werkzeug.security import generate_password_hash, check_password_hash
+
+MYT=ZoneInfo('Asia/Kuala_Lumpur')
+db=SQLAlchemy(); login_manager=LoginManager(); csrf=CSRFProtect()
+
+def now(): return datetime.now(timezone.utc)
+def money(v):
+    try:
+        d=Decimal(str(v)).quantize(Decimal('0.01'))
+        if not d.is_finite(): raise ValueError()
+        return d
+    except (InvalidOperation,ValueError,TypeError): raise ValueError('Invalid amount')
+
+def amount_positive(v):
+    d=money(v)
+    if d<=0: raise ValueError('Amount must be greater than zero')
+    return d
+
+def idgen(): return str(uuid.uuid4())
+
+class User(UserMixin,db.Model):
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    username=db.Column(db.String(80),unique=True,nullable=False)
+    password_hash=db.Column(db.String(255),nullable=False)
+    role=db.Column(db.String(20),nullable=False,default='staff')
+    active=db.Column(db.Boolean,nullable=False,default=True)
+    @property
+    def is_active(self): return self.active
+
+class Bank(db.Model):
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    name=db.Column(db.String(120),unique=True,nullable=False)
+    kind=db.Column(db.String(20),nullable=False,default='deposit')
+    opening_balance=db.Column(db.Numeric(18,2),nullable=False,default=0)
+    active=db.Column(db.Boolean,nullable=False,default=True)
+    created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+
+class Transaction(db.Model):
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    reference=db.Column(db.String(120),unique=True,nullable=False)
+    kind=db.Column(db.String(30),nullable=False)
+    signed_amount=db.Column(db.Numeric(18,2),nullable=False)
+    status=db.Column(db.String(20),nullable=False,default='confirmed')
+    customer_ref=db.Column(db.String(120))
+    remark=db.Column(db.Text)
+    created_by=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+    business_date=db.Column(db.Date,nullable=False)
+
+class Entry(db.Model):
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    transaction_id=db.Column(db.String(36),db.ForeignKey('transaction.id'),nullable=False,index=True)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
     delta=db.Column(db.Numeric(18,2),nullable=False)
     bank=db.relationship('Bank')
     transaction=db.relationship('Transaction')
@@ -190,3 +254,89 @@ def create_app(test_config=None):
     @login_required
     def new_transaction():
         if request.method=='POST':
+            try:
+                record(request.form.get('kind',''),request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None)
+                flash('Transaction confirmed and balance updated','success');return redirect(url_for('dashboard'))
+            except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
+        return render_template('transaction.html',banks=Bank.query.filter_by(active=True).order_by(Bank.name).all())
+
+    @app.get('/transactions')
+    @login_required
+    def transactions():
+        from sqlalchemy import or_
+        q = Transaction.query
+        search = request.args.get('search', '').strip()
+        kind = request.args.get('kind', 'all').strip().lower()
+        bank_id = request.args.get('bank_id', '').strip()
+
+        if search:
+            pattern = f'%{search}%'
+            matching_bank_ids = select(Bank.id).where(Bank.name.ilike(pattern))
+            matching_transaction_ids = select(Entry.transaction_id).where(
+                Entry.bank_id.in_(matching_bank_ids)
+            )
+            q = q.filter(or_(
+                Transaction.customer_ref.ilike(pattern),
+                Transaction.reference.ilike(pattern),
+                Transaction.id.in_(matching_transaction_ids)
+            ))
+        if kind in ('deposit', 'withdrawal', 'transfer'):
+            q = q.filter(Transaction.kind == kind)
+        if bank_id:
+            q = q.filter(Transaction.id.in_(
+                select(Entry.transaction_id).where(Entry.bank_id == bank_id)
+            ))
+
+        page = max(1, request.args.get('page', 1, type=int))
+        records = q.order_by(Transaction.created_at.desc(), Transaction.id.desc()).paginate(
+            page=page, per_page=30, error_out=False
+        )
+        ids = [t.id for t in records.items]
+        transaction_banks = {}
+        if ids:
+            entries = db.session.execute(
+                select(Entry.transaction_id, Entry.delta, Bank.name)
+                .join(Bank, Entry.bank_id == Bank.id)
+                .where(Entry.transaction_id.in_(ids))
+            ).all()
+            grouped = {}
+            for transaction_id, delta, name in entries:
+                grouped.setdefault(transaction_id, []).append((delta, name))
+            for t in records.items:
+                movements = grouped.get(t.id, [])
+                if t.kind == 'transfer':
+                    source = next((name for delta, name in movements if delta < 0), 'Unknown')
+                    destination = next((name for delta, name in movements if delta > 0), 'Unknown')
+                    transaction_banks[t.id] = f'{source} → {destination}'
+                else:
+                    transaction_banks[t.id] = movements[0][1] if movements else 'Unknown'
+
+        return render_template('transactions.html', records=records,
+                               transaction_banks=transaction_banks,
+                               banks=Bank.query.order_by(Bank.name).all(),
+                               search=search, kind=kind, bank_id=bank_id)
+
+    @app.route('/closing',methods=['GET','POST'])
+    @role_required('admin','finance')
+    def closing():
+        today=business_today()
+        if request.method=='POST':
+            try:
+                bank_id=request.form.get('bank_id','');actual=money(request.form.get('actual',''))
+                bs=lock_banks([bank_id]);
+                if len(bs)!=1: raise ValueError('Bank not found')
+                if Closing.query.filter_by(bank_id=bank_id,business_date=today).first(): raise ValueError('Already closed today')
+                sysbal=ledger_balance(bank_id)
+                close=Closing(bank_id=bank_id,business_date=today,system_balance=sysbal,actual_balance=actual,difference=actual-sysbal,remark=request.form.get('remark','').strip(),created_by=current_user.id)
+                db.session.add(close);db.session.add(Audit(actor_id=current_user.id,action='CLOSE_BANK',detail=f'{bank_id} {today} difference={actual-sysbal}'))
+                db.session.commit();flash('Bank closed for today','success')
+            except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
+            return redirect(url_for('closing'))
+        closes=Closing.query.filter_by(business_date=today).all()
+        return render_template('closing.html',banks=Bank.query.order_by(Bank.name).all(),balances=balances(),closes=closes,closed_ids={c.bank_id for c in closes})
+
+    @app.get('/health')
+    def health(): return {'status':'ok'}
+    return app
+
+app=create_app()

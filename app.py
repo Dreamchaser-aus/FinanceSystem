@@ -7,7 +7,7 @@ from flask import Flask, render_template, redirect, url_for, flash, request, abo
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import func, select, UniqueConstraint
+from sqlalchemy import func, select, UniqueConstraint, or_
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -134,6 +134,44 @@ def ledger_balance(bank_id,through=None):
 
 def business_today(): return datetime.now(MYT).date()
 
+def selected_date():
+    """Read-only reporting date. Future dates and malformed dates are rejected."""
+    raw = request.args.get('date', '').strip()
+    if not raw:
+        return business_today()
+    try:
+        day = date.fromisoformat(raw)
+    except ValueError:
+        abort(400, description='Invalid date. Expected YYYY-MM-DD')
+    if day > business_today():
+        abort(400, description='Future reporting dates are not supported')
+    return day
+
+def bank_status_on(bank, day, history_by_bank):
+    """Reconstruct status at end of MYT day from append-only history.
+
+    Historical states preceding the first history record use its old_status.
+    Banks without history use their current status (legacy limitation).
+    """
+    changes = history_by_bank.get(bank.id, [])
+    if not changes:
+        return bank.status
+    day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=MYT).astimezone(timezone.utc)
+    for h in reversed(changes):
+        if h.created_at.astimezone(timezone.utc) < day_end:
+            return h.new_status
+    return changes[0].old_status
+
+def balances_through(day):
+    q = (select(Entry.bank_id, func.coalesce(func.sum(Entry.delta), 0))
+         .join(Transaction, Entry.transaction_id == Transaction.id)
+         .where(Transaction.status == 'confirmed', Transaction.business_date <= day)
+         .group_by(Entry.bank_id))
+    changes = dict(db.session.execute(q).all())
+    return {b.id: money(b.opening_balance) + money(changes.get(b.id, 0))
+            for b in Bank.query.all()}
+
+
 def check_open_day(day,bank_ids):
     if day!=business_today(): raise ValueError('V1 only accepts current Malaysia business date')
     if Closing.query.filter(Closing.business_date==day,Closing.bank_id.in_(bank_ids)).first(): raise ValueError('Bank is closed for today')
@@ -239,39 +277,64 @@ def create_app(test_config=None):
     @app.get('/')
     @login_required
     def dashboard():
-        bank_page=max(1,request.args.get('bank_page',1,type=int))
-        active_query=Bank.query.filter(Bank.active.is_(True),Bank.status=='active').order_by(Bank.kind,Bank.name)
-        active_total=active_query.all()
-        bank_pagination=active_query.paginate(page=bank_page,per_page=10,error_out=False)
-        bs=bank_pagination.items;bal=balances()
-        today=business_today()
-        rows=db.session.execute(select(Transaction.kind,func.count(Transaction.id),func.coalesce(func.sum(Transaction.signed_amount),0)).where(Transaction.business_date==today,Transaction.status=='confirmed').group_by(Transaction.kind)).all()
-        totals={k:{'count':n,'amount':money(v)} for k,n,v in rows}
-        latest=Transaction.query.filter_by(status='confirmed').order_by(Transaction.created_at.desc(),Transaction.id.desc()).limit(20).all()
+        day = selected_date()
+        bank_page = max(1, request.args.get('bank_page', 1, type=int))
+        close_page = max(1, request.args.get('close_page', 1, type=int))
+        all_banks = Bank.query.order_by(Bank.kind, Bank.name).all()
+        history = BankStatusHistory.query.order_by(BankStatusHistory.created_at, BankStatusHistory.id).all()
+        history_by_bank = {}
+        for h in history:
+            history_by_bank.setdefault(h.bank_id, []).append(h)
+        day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=MYT).astimezone(timezone.utc)
+        existing = [b for b in all_banks if b.created_at is None or b.created_at.astimezone(timezone.utc) < day_end]
+        statuses = {b.id: bank_status_on(b, day, history_by_bank) for b in existing}
+        bal = balances_through(day)
+        # "Bank Block" means status=closed; other issues remain in the closing total.
+        blocked = [b for b in existing if statuses[b.id] == 'closed']
+        active_banks = [b for b in existing if statuses[b.id] == 'active']
+        closing_total = sum((bal[b.id] for b in existing if statuses[b.id] != 'closed'), Decimal('0'))
+        active_total = sum((bal[b.id] for b in active_banks), Decimal('0'))
+        start = (bank_page - 1) * 10
+        bank_items = active_banks[start:start + 10]
+        bank_pages = max(1, (len(active_banks) + 9) // 10)
+        bank_page = min(bank_page, bank_pages)
+        bank_items = active_banks[(bank_page-1)*10:bank_page*10]
+        rows = db.session.execute(
+            select(Transaction.kind, func.count(Transaction.id), func.coalesce(func.sum(Transaction.signed_amount), 0))
+            .where(Transaction.business_date == day, Transaction.status == 'confirmed')
+            .group_by(Transaction.kind)).all()
+        totals = {k: {'count': n, 'amount': money(v)} for k, n, v in rows}
+        latest = (Transaction.query.filter_by(status='confirmed', business_date=day)
+                  .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
         transaction_banks = {}
-        latest_ids = [t.id for t in latest]
-        if latest_ids:
+        ids = [t.id for t in latest]
+        if ids:
             movements = db.session.execute(
                 select(Entry.transaction_id, Entry.delta, Bank.name)
                 .join(Bank, Entry.bank_id == Bank.id)
-                .where(Entry.transaction_id.in_(latest_ids))
-            ).all()
+                .where(Entry.transaction_id.in_(ids))).all()
             grouped = {}
-            for transaction_id, delta, bank_name in movements:
-                grouped.setdefault(transaction_id, []).append((delta, bank_name))
+            for tid, delta, name in movements:
+                grouped.setdefault(tid, []).append((delta, name))
             for t in latest:
                 items = grouped.get(t.id, [])
                 if t.kind == 'transfer':
                     source = next((name for delta, name in items if delta < 0), 'Unknown')
-                    destination = next((name for delta, name in items if delta > 0), 'Unknown')
-                    transaction_banks[t.id] = f'{source} → {destination}'
+                    dest = next((name for delta, name in items if delta > 0), 'Unknown')
+                    transaction_banks[t.id] = f'{source} → {dest}'
                 else:
                     transaction_banks[t.id] = items[0][1] if items else 'Unknown'
+        closed_query = (Closing.query.filter_by(business_date=day)
+                        .order_by(Closing.created_at.desc(), Closing.id.desc()))
+        closed_page = closed_query.paginate(page=close_page, per_page=10, error_out=False)
         return render_template(
-            'dashboard.html', banks=bs, balances=bal, totals=totals,
-            latest=latest, transaction_banks=transaction_banks,
-            grand=sum((bal[b.id] for b in active_total),Decimal('0')),page_total=sum((bal[b.id] for b in bs),Decimal('0')),bank_pagination=bank_pagination
-        )
+            'dashboard.html', selected_day=day, banks=bank_items, balances=bal,
+            totals=totals, latest=latest, transaction_banks=transaction_banks,
+            grand=active_total, page_total=sum((bal[b.id] for b in bank_items), Decimal('0')),
+            bank_page=bank_page, bank_pages=bank_pages, active_count=len(active_banks),
+            block_count=len(blocked), block_banks=blocked, closing_total=closing_total,
+            closed_banks=closed_page.items, closed_page=closed_page,
+            closed_count=closed_page.total, statuses=statuses)
 
     @app.route('/banks',methods=['GET','POST'])
     @login_required
@@ -288,12 +351,14 @@ def create_app(test_config=None):
                 db.session.commit();flash('Bank created','success')
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('banks'))
+        day=selected_date()
         bank_page=max(1,request.args.get('bank_page',1,type=int))
         history_page=max(1,request.args.get('history_page',1,type=int))
         bank_pagination=Bank.query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
-        history_pagination=BankStatusHistory.query.order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
+        end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
+        history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
         return render_template('banks.html',banks=bank_pagination.items,balances=balances(),
-                               statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination)
+                               statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day)
 
     @app.post('/banks/<bank_id>/status')
     @role_required('admin','staff')
@@ -349,7 +414,8 @@ def create_app(test_config=None):
     @login_required
     def transactions():
         from sqlalchemy import or_
-        q = Transaction.query
+        day = selected_date()
+        q = Transaction.query.filter(Transaction.business_date == day)
         search = request.args.get('search', '').strip()
         kind = request.args.get('kind', 'all').strip().lower()
         bank_id = request.args.get('bank_id', '').strip()
@@ -399,7 +465,7 @@ def create_app(test_config=None):
         return render_template('transactions.html', records=records,
                                transaction_banks=transaction_banks,
                                banks=Bank.query.order_by(Bank.name).all(),
-                               search=search, kind=kind, bank_id=bank_id)
+                               search=search, kind=kind, bank_id=bank_id, selected_day=day)
 
     @app.route('/transactions/<transaction_id>/edit', methods=['GET','POST'])
     @role_required('admin','staff')
@@ -512,10 +578,15 @@ def create_app(test_config=None):
                 db.session.commit();flash('Bank closed for today','success')
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('closing'))
-        closes_all=Closing.query.filter_by(business_date=today).all()
+        day=selected_date()
+        closes_all=Closing.query.filter_by(business_date=day).all()
         close_page=max(1,request.args.get('page',1,type=int))
-        close_pagination=Closing.query.filter_by(business_date=today).order_by(Closing.created_at.desc(),Closing.id.desc()).paginate(page=close_page,per_page=15,error_out=False)
-        return render_template('closing.html',banks=Bank.query.order_by(Bank.name).all(),balances=balances(),closes=close_pagination.items,close_pagination=close_pagination,closed_ids={c.bank_id for c in closes_all})
+        close_pagination=Closing.query.filter_by(business_date=day).order_by(Closing.created_at.desc(),Closing.id.desc()).paginate(page=close_page,per_page=15,error_out=False)
+        return render_template('closing.html',banks=Bank.query.order_by(Bank.name).all(),balances=balances(),closes=close_pagination.items,close_pagination=close_pagination,closed_ids={c.bank_id for c in closes_all},selected_day=day,can_close=(day==today))
+
+    @app.context_processor
+    def inject_report_date():
+        return {'report_date': request.args.get('date', business_today().isoformat()), 'today_myt': business_today().isoformat()}
 
     @app.get('/health')
     def health(): return {'status':'ok'}

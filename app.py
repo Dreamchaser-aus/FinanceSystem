@@ -11,7 +11,7 @@ from sqlalchemy import func, select, UniqueConstraint, or_
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
-MYT=ZoneInfo('Asia/Kuala_Lumpur')
+MYT=ZoneInfo(os.getenv('BUSINESS_TIMEZONE','Asia/Kuala_Lumpur'))
 db=SQLAlchemy(); login_manager=LoginManager(); csrf=CSRFProtect()
 
 def now(): return datetime.now(timezone.utc)
@@ -89,6 +89,25 @@ class Entry(db.Model):
     bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
     delta=db.Column(db.Numeric(18,2),nullable=False)
     bank=db.relationship('Bank')
+    transaction=db.relationship('Transaction')
+
+class Dealer(db.Model):
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    name=db.Column(db.String(120),unique=True,nullable=False)
+    active=db.Column(db.Boolean,nullable=False,default=True)
+    created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+
+class DealerTrade(db.Model):
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    transaction_id=db.Column(db.String(36),db.ForeignKey('transaction.id'),unique=True,nullable=False,index=True)
+    dealer_id=db.Column(db.String(36),db.ForeignKey('dealer.id'),nullable=False,index=True)
+    aud_amount=db.Column(db.Numeric(18,2),nullable=False)
+    rate=db.Column(db.Numeric(18,6),nullable=False)
+    myr_amount=db.Column(db.Numeric(18,2),nullable=False)
+    # positive: dealer owes us MYR; negative: we owe dealer MYR
+    myr_delta=db.Column(db.Numeric(18,2),nullable=False)
+    flow=db.Column(db.String(30),nullable=False)
+    dealer=db.relationship('Dealer')
     transaction=db.relationship('Transaction')
 
 class Closing(db.Model):
@@ -232,6 +251,48 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
     except Exception:
         db.session.rollback();raise
 
+def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, customer_ref='', remark=''):
+    if kind not in ('dealer_sell','dealer_buy','dealer_payout'):
+        raise ValueError('Unsupported dealer transaction')
+    reference=reference.strip()
+    if not reference: raise ValueError('Transaction ID required')
+    aud=amount_positive(amount)
+    try: fx=Decimal(str(rate))
+    except (InvalidOperation,TypeError): raise ValueError('Invalid exchange rate')
+    if not fx.is_finite() or fx<=0 or fx>Decimal('1000') or fx.as_tuple().exponent < -6:
+        raise ValueError('Exchange rate must be positive with at most 6 decimals')
+    myr=money(aud*fx)
+    if kind=='dealer_payout' and not customer_ref.strip(): raise ValueError('Customer ID required')
+    if kind=='dealer_payout' and bank_id: raise ValueError('Dealer direct payout must not select a bank')
+    if kind!='dealer_payout' and not bank_id: raise ValueError('Select a real bank')
+    day=business_today()
+    try:
+        dealer=db.session.execute(select(Dealer).where(Dealer.id==dealer_id).with_for_update()).scalar_one_or_none()
+        if not dealer or not dealer.active: raise ValueError('Dealer missing or inactive')
+        if Transaction.query.filter_by(reference=reference).first(): raise ValueError('Duplicate Transaction ID')
+        delta=Decimal('0')
+        if bank_id:
+            banks=lock_banks([bank_id])
+            if len(banks)!=1 or not banks[0].active: raise ValueError('Bank missing or inactive')
+            bank=banks[0]
+            if bank.status!='active' and not (kind=='dealer_buy' and bank.status=='cannot_transfer'):
+                raise ValueError(f'Bank {bank.name} status does not permit this movement')
+            check_open_day(day,[bank_id])
+            delta=-aud if kind=='dealer_sell' else aud
+            if delta<0 and ledger_balance(bank_id)<aud: raise ValueError('Insufficient bank balance')
+        # dealer payout counts as customer withdrawal, without any bank Entry
+        t=Transaction(reference=reference,kind=kind,signed_amount=(-aud if kind!='dealer_buy' else aud),
+                      customer_ref=customer_ref.strip() or None,remark=remark.strip()[:2000],created_by=user_id,business_date=day)
+        db.session.add(t);db.session.flush()
+        if bank_id: db.session.add(Entry(transaction_id=t.id,bank_id=bank_id,delta=delta))
+        db.session.add(DealerTrade(transaction_id=t.id,dealer_id=dealer_id,aud_amount=aud,rate=fx,
+                        myr_amount=myr,myr_delta=myr if kind=='dealer_sell' else -myr,flow=kind))
+        db.session.add(Audit(actor_id=user_id,action='CREATE_DEALER_TRANSACTION',detail=f'{t.id} {kind} {reference} AUD={aud} rate={fx} MYR={myr}'))
+        db.session.commit()
+        return t
+    except Exception:
+        db.session.rollback();raise
+
 @login_manager.user_loader
 def load_user(uid): return db.session.get(User,uid)
 
@@ -340,7 +401,7 @@ def create_app(test_config=None):
                     dest = next((name for delta, name in items if delta > 0), 'Unknown')
                     transaction_banks[t.id] = f'{source} → {dest}'
                 else:
-                    transaction_banks[t.id] = items[0][1] if items else 'Unknown'
+                    transaction_banks[t.id] = items[0][1] if items else ('Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
         closed_query = (Closing.query.filter(Closing.business_date.between(start_day, day))
                         .order_by(Closing.created_at.desc(), Closing.id.desc()))
         closed_page = closed_query.paginate(page=close_page, per_page=10, error_out=False)
@@ -348,7 +409,7 @@ def create_app(test_config=None):
         # Active = distinct IDs with confirmed deposit/withdrawal in selected range.
         # New = active IDs whose first ever confirmed deposit/withdrawal is in range.
         activity_filter = (Transaction.status == 'confirmed',
-                           Transaction.kind.in_(['deposit', 'withdrawal']),
+                           Transaction.kind.in_(['deposit', 'withdrawal', 'dealer_payout']),
                            Transaction.customer_ref.isnot(None),
                            func.length(func.trim(Transaction.customer_ref)) > 0)
         normalized_id = func.lower(func.trim(Transaction.customer_ref))
@@ -438,15 +499,43 @@ def create_app(test_config=None):
             raise
         return redirect(url_for('banks'))
 
+    @app.route('/dealers',methods=['GET','POST'])
+    @login_required
+    def dealers():
+        if request.method=='POST':
+            if current_user.role!='admin': abort(403)
+            name=request.form.get('name','').strip()
+            if not name: flash('Dealer name required','danger')
+            else:
+                try:
+                    db.session.add(Dealer(name=name));db.session.commit();flash('Dealer added','success')
+                except IntegrityError:
+                    db.session.rollback();flash('Dealer already exists','danger')
+            return redirect(url_for('dealers'))
+        items=Dealer.query.order_by(Dealer.name).all()
+        rows=db.session.execute(select(DealerTrade.dealer_id,DealerTrade.flow,func.sum(DealerTrade.aud_amount),func.sum(DealerTrade.myr_delta)).join(Transaction,Transaction.id==DealerTrade.transaction_id).where(Transaction.status=='confirmed').group_by(DealerTrade.dealer_id,DealerTrade.flow)).all()
+        totals={}
+        for did,flow,aud,myr in rows:
+            d=totals.setdefault(did,{'dealer_sell':Decimal('0'),'dealer_buy':Decimal('0'),'dealer_payout':Decimal('0'),'myr':Decimal('0')})
+            d[flow]+=aud;d['myr']+=myr
+        return render_template('dealers.html',dealers=items,totals=totals)
+
     @app.route('/transactions/new',methods=['GET','POST'])
     @login_required
     def new_transaction():
         if request.method=='POST':
             try:
-                record(request.form.get('kind',''),request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None)
+                kind=request.form.get('kind','')
+                if kind in ('dealer_sell','dealer_buy','dealer_payout'):
+                    record_dealer(kind,request.form.get('reference',''),request.form.get('amount',''),
+                                  request.form.get('bank_id','') if kind!='dealer_payout' else None,
+                                  current_user.id,request.form.get('dealer_id',''),request.form.get('rate',''),
+                                  request.form.get('customer_ref',''),request.form.get('remark',''))
+                else:
+                    record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None)
                 flash('Transaction confirmed and balance updated','success');return redirect(url_for('dashboard'))
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
-        return render_template('transaction.html',banks=Bank.query.filter_by(active=True).order_by(Bank.name).all())
+        return render_template('transaction.html',banks=Bank.query.filter_by(active=True).order_by(Bank.name).all(),dealers=Dealer.query.filter_by(active=True).order_by(Dealer.name).all())
 
     @app.get('/transactions')
     @login_required
@@ -456,7 +545,7 @@ def create_app(test_config=None):
         q = Transaction.query.filter(Transaction.business_date == day)
         search = request.args.get('search', '').strip()
         kinds = [v for v in request.args.getlist('kind')
-                 if v in ('deposit', 'withdrawal', 'transfer')]
+                 if v in ('deposit', 'withdrawal', 'transfer','dealer_sell','dealer_buy','dealer_payout')]
         kinds = list(dict.fromkeys(kinds))
         bank_id = request.args.get('bank_id', '').strip()
 
@@ -500,7 +589,7 @@ def create_app(test_config=None):
                     destination = next((name for delta, name in movements if delta > 0), 'Unknown')
                     transaction_banks[t.id] = f'{source} → {destination}'
                 else:
-                    transaction_banks[t.id] = movements[0][1] if movements else 'Unknown'
+                    transaction_banks[t.id] = movements[0][1] if movements else ('Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
 
         return render_template('transactions.html', records=records,
                                transaction_banks=transaction_banks,
@@ -513,6 +602,9 @@ def create_app(test_config=None):
         t=db.session.get(Transaction,transaction_id)
         if not t: abort(404)
         if request.method=='GET':
+            if t.kind.startswith('dealer_'):
+                flash('Dealer transactions require a controlled reversal; editing is disabled','warning')
+                return redirect(url_for('transactions'))
             if t.status!='confirmed':
                 flash('Voided transactions cannot be edited','warning')
                 return redirect(url_for('transactions'))
@@ -524,6 +616,7 @@ def create_app(test_config=None):
             # Serialize all edits/deletes of the same transaction.
             t=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
             if not t: abort(404)
+            if t.kind.startswith('dealer_'): raise ValueError('Dealer transactions require an audited reversal; edit/void is disabled')
             if t.status!='confirmed': raise ValueError('Transaction already voided')
             if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be edited')
             kind=request.form.get('kind','').strip()
@@ -581,6 +674,7 @@ def create_app(test_config=None):
         try:
             t=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
             if not t: abort(404)
+            if t.kind.startswith('dealer_'): raise ValueError('Dealer transactions require an audited reversal; edit/void is disabled')
             if t.status!='confirmed': raise ValueError('Transaction already voided')
             if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be voided')
             entries=Entry.query.filter_by(transaction_id=t.id).all()

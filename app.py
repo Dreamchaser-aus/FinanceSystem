@@ -3,11 +3,11 @@ from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from zoneinfo import ZoneInfo
-from flask import Flask, render_template, redirect, url_for, flash, request, abort
+from flask import Flask, render_template, redirect, url_for, flash, request, abort, g, session
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import func, select, UniqueConstraint, or_
+from sqlalchemy import func, select, UniqueConstraint, or_, and_
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -37,8 +37,89 @@ class User(UserMixin,db.Model):
     active=db.Column(db.Boolean,nullable=False,default=True)
     @property
     def is_active(self): return self.active
+    platform_access=db.relationship("UserPlatformAccess",cascade="all, delete-orphan",back_populates="user")
+    permissions=db.relationship("UserPermission",cascade="all, delete-orphan")
+
+
+class Platform(db.Model):
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    name=db.Column(db.String(120),nullable=False,unique=True)
+    active=db.Column(db.Boolean,nullable=False,default=True)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+
+class UserPlatformAccess(db.Model):
+    __tablename__='user_platform_access'
+    user_id=db.Column(db.String(36),db.ForeignKey('user.id'),primary_key=True)
+    platform_id=db.Column(db.String(36),db.ForeignKey('platform.id'),primary_key=True)
+    user=db.relationship('User',back_populates='platform_access')
+
+class UserPermission(db.Model):
+    __tablename__='user_permission'
+    user_id=db.Column(db.String(36),db.ForeignKey('user.id'),primary_key=True)
+    permission=db.Column(db.String(60),primary_key=True)
+
+PERMISSIONS={
+    'view_dashboard':'View dashboard',
+    'view_banks':'View banks',
+    'create_transaction':'Create transactions',
+    'view_transactions':'View transaction history',
+    'edit_transaction':'Edit / void transactions',
+    'update_bank_status':'Update bank status',
+    'view_dealers':'View dealer ledger',
+    'close_bank':'Daily closing',
+}
+DEFAULT_ROLE_PERMS={
+    'staff':{'view_dashboard','view_banks','create_transaction','view_transactions','view_dealers'},
+    'finance':{'view_dashboard','view_banks','view_transactions','view_dealers','close_bank'},
+    'manager':set(PERMISSIONS),
+}
+
+def permitted(permission):
+    if current_user.role=='admin': return True
+    return db.session.get(UserPermission,(current_user.id,permission)) is not None
+
+def require_permission(permission):
+    if not permitted(permission): abort(403)
+
+def permitted_platform_ids():
+    if current_user.role=='admin':
+        return set(db.session.execute(select(Platform.id)).scalars().all())
+    return set(db.session.execute(select(UserPlatformAccess.platform_id).where(UserPlatformAccess.user_id==current_user.id)).scalars().all())
+
+def selected_platform_id():
+    """Fail closed for staff. Admin may choose All Platforms only for read-only reports."""
+    requested=request.args.get('platform_id') or request.form.get('platform_id') or session.get('platform_id')
+    allowed=permitted_platform_ids()
+    if current_user.role=='admin' and requested=='all':return None
+    if requested and requested in allowed: return requested
+    if requested and requested not in allowed: abort(403)
+    if current_user.role=='admin' and not requested:return None
+    if len(allowed)==1:return next(iter(allowed))
+    # Multi-platform staff must select a specific authorized platform.
+    abort(400,description='Select an authorized platform from the platform switcher')
+
+def platform_scope(model):
+    pid=selected_platform_id()
+    return (model.platform_id==pid) if pid else True
+
+def require_platform(pid):
+    if not pid or pid not in permitted_platform_ids():abort(403)
+    chosen=selected_platform_id()
+    if chosen is not None and pid!=chosen:abort(403)
+
+def require_single_platform():
+    pid=selected_platform_id()
+    if pid is None: abort(400,description='Select one platform before making changes')
+    require_platform(pid)
+    return pid
+
+def bank_for_platform(bank_id,pid):
+    b=db.session.get(Bank,bank_id)
+    if not b or b.platform_id!=pid:abort(403)
+    return b
 
 class Bank(db.Model):
+    platform_id=db.Column(db.String(36),db.ForeignKey("platform.id"),nullable=False,index=True)
     id=db.Column(db.String(36),primary_key=True,default=idgen)
     name=db.Column(db.String(120),unique=True,nullable=False)
     kind=db.Column(db.String(20),nullable=False,default='deposit')
@@ -72,6 +153,7 @@ BANK_STATUSES={
 }
 
 class Transaction(db.Model):
+    platform_id=db.Column(db.String(36),db.ForeignKey("platform.id"),nullable=False,index=True)
     id=db.Column(db.String(36),primary_key=True,default=idgen)
     reference=db.Column(db.String(120),unique=True,nullable=False)
     kind=db.Column(db.String(30),nullable=False)
@@ -92,6 +174,7 @@ class Entry(db.Model):
     transaction=db.relationship('Transaction')
 
 class Dealer(db.Model):
+    platform_id=db.Column(db.String(36),db.ForeignKey("platform.id"),nullable=False,index=True)
     id=db.Column(db.String(36),primary_key=True,default=idgen)
     name=db.Column(db.String(120),unique=True,nullable=False)
     active=db.Column(db.Boolean,nullable=False,default=True)
@@ -216,16 +299,17 @@ def lock_banks(ids):
     # Postgres row locks serialize balance checks and updates; SQLite is for local demo only.
     return db.session.execute(select(Bank).where(Bank.id.in_(sorted(set(ids)))).order_by(Bank.id).with_for_update()).scalars().all()
 
-def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_bank_id=None):
+def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_bank_id=None,platform_id=None):
     if not reference.strip(): raise ValueError('Transaction ID required')
     if kind not in ('deposit','withdrawal','transfer'): raise ValueError('Unsupported type')
+    if not platform_id: raise ValueError("Select platform")
     a=amount_positive(amount); ids=[bank_id]+([to_bank_id] if to_bank_id else [])
     if kind=='transfer' and (not to_bank_id or to_bank_id==bank_id): raise ValueError('Choose two different banks')
     if kind!='transfer' and to_bank_id: raise ValueError('Unexpected destination bank')
     day=business_today()
     try:
         bs=lock_banks(ids)
-        if len(bs)!=len(ids) or any(not b.active for b in bs): raise ValueError('Bank missing or inactive')
+        if len(bs)!=len(ids) or any(not b.active or b.platform_id!=platform_id for b in bs): raise ValueError('Bank missing, inactive or belongs to another platform')
         # A bank marked cannot_transfer may receive funds but cannot send funds.
         # All other non-active states block new movements in either direction.
         for b in bs:
@@ -241,7 +325,7 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
         if Transaction.query.filter_by(reference=reference.strip()).first(): raise ValueError('Duplicate Transaction ID')
         delta=a if kind=='deposit' else -a
         if delta<0 and ledger_balance(bank_id)<a: raise ValueError('Insufficient balance (negative balances blocked for new debits)')
-        t=Transaction(reference=reference.strip(),kind=kind,signed_amount=delta,customer_ref=customer_ref.strip() or None,remark=remark.strip(),created_by=user_id,business_date=day)
+        t=Transaction(platform_id=platform_id,reference=reference.strip(),kind=kind,signed_amount=delta,customer_ref=customer_ref.strip() or None,remark=remark.strip(),created_by=user_id,business_date=day)
         db.session.add(t);db.session.flush()
         db.session.add(Entry(transaction_id=t.id,bank_id=bank_id,delta=delta))
         if kind=='transfer': db.session.add(Entry(transaction_id=t.id,bank_id=to_bank_id,delta=a))
@@ -251,7 +335,8 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
     except Exception:
         db.session.rollback();raise
 
-def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, customer_ref='', remark=''):
+def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, customer_ref='', remark='',platform_id=None):
+    if not platform_id: raise ValueError('Select platform')
     if kind not in ('dealer_sell','dealer_buy','dealer_payout'):
         raise ValueError('Unsupported dealer transaction')
     reference=reference.strip()
@@ -268,12 +353,12 @@ def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, cu
     day=business_today()
     try:
         dealer=db.session.execute(select(Dealer).where(Dealer.id==dealer_id).with_for_update()).scalar_one_or_none()
-        if not dealer or not dealer.active: raise ValueError('Dealer missing or inactive')
+        if not dealer or not dealer.active or dealer.platform_id!=platform_id: raise ValueError('Dealer missing, inactive or belongs to another platform')
         if Transaction.query.filter_by(reference=reference).first(): raise ValueError('Duplicate Transaction ID')
         delta=Decimal('0')
         if bank_id:
             banks=lock_banks([bank_id])
-            if len(banks)!=1 or not banks[0].active: raise ValueError('Bank missing or inactive')
+            if len(banks)!=1 or not banks[0].active or banks[0].platform_id!=platform_id: raise ValueError('Bank missing, inactive or belongs to another platform')
             bank=banks[0]
             if bank.status!='active' and not (kind=='dealer_buy' and bank.status=='cannot_transfer'):
                 raise ValueError(f'Bank {bank.name} status does not permit this movement')
@@ -281,7 +366,7 @@ def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, cu
             delta=-aud if kind=='dealer_sell' else aud
             if delta<0 and ledger_balance(bank_id)<aud: raise ValueError('Insufficient bank balance')
         # dealer payout counts as customer withdrawal, without any bank Entry
-        t=Transaction(reference=reference,kind=kind,signed_amount=(-aud if kind!='dealer_buy' else aud),
+        t=Transaction(platform_id=platform_id,reference=reference,signed_amount=(-aud if kind!='dealer_buy' else aud),
                       customer_ref=customer_ref.strip() or None,remark=remark.strip()[:2000],created_by=user_id,business_date=day)
         db.session.add(t);db.session.flush()
         if bank_id: db.session.add(Entry(transaction_id=t.id,bank_id=bank_id,delta=delta))
@@ -339,18 +424,105 @@ def create_app(test_config=None):
         else:
             print('Database ready; administrator already exists')
 
+    @app.before_request
+    def enforce_platform_permissions():
+        if not current_user.is_authenticated:return
+        endpoint=request.endpoint or ''
+        permission_routes={
+            'dashboard':'view_dashboard','banks':'view_banks',
+            'new_transaction':'create_transaction','transactions':'view_transactions',
+            'edit_transaction':'edit_transaction','delete_transaction':'edit_transaction',
+            'update_bank_status':'update_bank_status','dealers':'view_dealers',
+            'closing':'close_bank',
+        }
+        if endpoint in permission_routes:require_permission(permission_routes[endpoint])
+
+    @app.post('/switch-platform')
+    @login_required
+    def switch_platform():
+        pid=request.form.get('platform_id','')
+        if pid=='all' and current_user.role=='admin':pass
+        elif pid not in permitted_platform_ids():abort(403)
+        session['platform_id']=pid
+        return redirect(url_for('dashboard'))
+
+    @app.route('/admin/platforms',methods=['GET','POST'])
+    @role_required('admin')
+    def manage_platforms():
+        if request.method=='POST':
+            name=request.form.get('name','').strip()[:120]
+            if not name:flash('Platform name is required','danger')
+            else:
+                try:
+                    obj=Platform(name=name);db.session.add(obj)
+                    db.session.flush()
+                    db.session.add(Audit(actor_id=current_user.id,action='CREATE_PLATFORM',detail=f'{obj.id} {name}'))
+                    db.session.commit();flash('Platform created','success')
+                except IntegrityError:db.session.rollback();flash('Platform already exists','danger')
+            return redirect(url_for('manage_platforms'))
+        return render_template('platforms.html',platforms=Platform.query.order_by(Platform.name).all())
+
+    @app.route('/admin/staff',methods=['GET','POST'])
+    @role_required('admin')
+    def manage_staff():
+        if request.method=='POST':
+            try:
+                username=request.form.get('username','').strip()
+                password=request.form.get('password','')
+                role=request.form.get('role','staff')
+                selected=set(request.form.getlist('platform_ids'))
+                allowed=set(db.session.execute(select(Platform.id)).scalars().all())
+                perms=set(request.form.getlist('permissions'))
+                if not username or len(username)>80 or len(password)<12:raise ValueError('Username required; password must be 12+ characters')
+                if role not in DEFAULT_ROLE_PERMS:raise ValueError('Invalid role')
+                if not selected or not selected.issubset(allowed):raise ValueError('Choose valid platforms')
+                if not perms.issubset(PERMISSIONS):raise ValueError('Invalid permissions')
+                u=User(username=username,password_hash=generate_password_hash(password),role=role)
+                db.session.add(u);db.session.flush()
+                for pid in selected:db.session.add(UserPlatformAccess(user_id=u.id,platform_id=pid))
+                for permission in perms:db.session.add(UserPermission(user_id=u.id,permission=permission))
+                db.session.add(Audit(actor_id=current_user.id,action='CREATE_STAFF',detail=f'{u.id} {username} role={role}'))
+                db.session.commit();flash('Staff created','success')
+            except (ValueError,IntegrityError) as exc:db.session.rollback();flash(str(exc),'danger')
+            return redirect(url_for('manage_staff'))
+        users=User.query.order_by(User.username).all()
+        return render_template('staff.html',users=users,platforms=Platform.query.order_by(Platform.name).all(),permissions=PERMISSIONS,defaults=DEFAULT_ROLE_PERMS,user_permission_map={u.id:{p.permission for p in u.permissions} for u in users})
+
+    @app.post('/admin/staff/<uid>/update')
+    @role_required('admin')
+    def update_staff(uid):
+        u=db.session.get(User,uid)
+        if not u or u.role=='admin':abort(403)
+        selected=set(request.form.getlist('platform_ids'))
+        allowed=set(db.session.execute(select(Platform.id)).scalars().all())
+        perms=set(request.form.getlist('permissions'))
+        role=request.form.get('role','staff')
+        if not selected or not selected.issubset(allowed) or not perms.issubset(PERMISSIONS) or role not in DEFAULT_ROLE_PERMS:abort(400)
+        u.role=role;u.active=request.form.get('active')=='1'
+        UserPlatformAccess.query.filter_by(user_id=uid).delete()
+        UserPermission.query.filter_by(user_id=uid).delete()
+        db.session.flush()
+        for pid in selected:db.session.add(UserPlatformAccess(user_id=uid,platform_id=pid))
+        for perm in perms:db.session.add(UserPermission(user_id=uid,permission=perm))
+        db.session.add(Audit(actor_id=current_user.id,action='UPDATE_STAFF',detail=f'{uid} role={role} active={u.active}'))
+        db.session.commit();flash('Staff permissions updated','success')
+        return redirect(url_for('manage_staff'))
+
     @app.route('/login',methods=['GET','POST'])
     def login():
         if request.method=='POST':
             u=User.query.filter_by(username=request.form.get('username','')).first()
             if u and u.active and check_password_hash(u.password_hash,request.form.get('password','')):
-                login_user(u);return redirect(url_for('dashboard'))
+                login_user(u)
+                ids=permitted_platform_ids()
+                session['platform_id']='all' if u.role=='admin' else (sorted(ids)[0] if ids else '')
+                return redirect(url_for('dashboard'))
             flash('Invalid credentials','danger')
         return render_template('login.html')
 
     @app.post('/logout')
     @login_required
-    def logout(): logout_user();return redirect(url_for('login'))
+    def logout(): logout_user();session.pop('platform_id',None);return redirect(url_for('login'))
 
     @app.get('/')
     @login_required
@@ -358,8 +530,8 @@ def create_app(test_config=None):
         start_day, day = selected_range()
         bank_page = max(1, request.args.get('bank_page', 1, type=int))
         close_page = max(1, request.args.get('close_page', 1, type=int))
-        all_banks = Bank.query.order_by(Bank.kind, Bank.name).all()
-        history = BankStatusHistory.query.order_by(BankStatusHistory.created_at, BankStatusHistory.id).all()
+        all_banks = Bank.query.filter(platform_scope(Bank)).order_by(Bank.kind, Bank.name).all()
+        history = BankStatusHistory.query.filter(BankStatusHistory.bank_id.in_([b.id for b in all_banks])).order_by(BankStatusHistory.created_at, BankStatusHistory.id).all()
         history_by_bank = {}
         for h in history:
             history_by_bank.setdefault(h.bank_id, []).append(h)
@@ -379,10 +551,10 @@ def create_app(test_config=None):
         bank_items = active_banks[(bank_page-1)*10:bank_page*10]
         rows = db.session.execute(
             select(Transaction.kind, func.count(Transaction.id), func.coalesce(func.sum(Transaction.signed_amount), 0))
-            .where(Transaction.business_date.between(start_day, day), Transaction.status == 'confirmed')
+            .where(Transaction.business_date.between(start_day, day), Transaction.status == 'confirmed',platform_scope(Transaction))
             .group_by(Transaction.kind)).all()
         totals = {k: {'count': n, 'amount': money(v)} for k, n, v in rows}
-        latest = (Transaction.query.filter(Transaction.status=='confirmed', Transaction.business_date.between(start_day, day))
+        latest = (Transaction.query.filter(Transaction.status=='confirmed', Transaction.business_date.between(start_day, day),platform_scope(Transaction))
                   .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
         transaction_banks = {}
         ids = [t.id for t in latest]
@@ -402,13 +574,13 @@ def create_app(test_config=None):
                     transaction_banks[t.id] = f'{source} → {dest}'
                 else:
                     transaction_banks[t.id] = items[0][1] if items else ('Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
-        closed_query = (Closing.query.filter(Closing.business_date.between(start_day, day))
+        closed_query = (Closing.query.filter(Closing.business_date.between(start_day, day),Closing.bank_id.in_([b.id for b in all_banks]))
                         .order_by(Closing.created_at.desc(), Closing.id.desc()))
         closed_page = closed_query.paginate(page=close_page, per_page=10, error_out=False)
         # A customer is identified by normalized customer_ref (customer ID).
         # Active = distinct IDs with confirmed deposit/withdrawal in selected range.
         # New = active IDs whose first ever confirmed deposit/withdrawal is in range.
-        activity_filter = (Transaction.status == 'confirmed',
+        activity_filter = (platform_scope(Transaction),Transaction.status == 'confirmed',
                            Transaction.kind.in_(['deposit', 'withdrawal', 'dealer_payout']),
                            Transaction.customer_ref.isnot(None),
                            func.length(func.trim(Transaction.customer_ref)) > 0)
@@ -424,12 +596,12 @@ def create_app(test_config=None):
         first_dates = dict(first_seen)
         new_count = sum(1 for customer_id in active_ids
                         if start_day <= first_dates[customer_id] <= day)
-        dealer_items = Dealer.query.order_by(Dealer.name).all()
+        dealer_items = Dealer.query.filter(platform_scope(Dealer)).order_by(Dealer.name).all()
         dealer_rows = db.session.execute(
             select(DealerTrade.dealer_id, DealerTrade.flow,
                    func.sum(DealerTrade.aud_amount), func.sum(DealerTrade.myr_delta))
             .join(Transaction, Transaction.id == DealerTrade.transaction_id)
-            .where(Transaction.status == 'confirmed')
+            .where(Transaction.status == 'confirmed',platform_scope(Transaction))
             .group_by(DealerTrade.dealer_id, DealerTrade.flow)
         ).all()
         dealer_totals = {}
@@ -460,7 +632,8 @@ def create_app(test_config=None):
                 name=request.form.get('name','').strip()
                 kind=request.form.get('kind','')
                 if not name or kind not in ('deposit','withdrawal','store','other'): raise ValueError('Invalid bank details')
-                b=Bank(name=name,kind=kind,opening_balance=money(request.form.get('opening_balance','0')))
+                pid=require_single_platform()
+                b=Bank(platform_id=pid,name=name,kind=kind,opening_balance=money(request.form.get('opening_balance','0')))
                 db.session.add(b);db.session.flush()
                 db.session.add(Audit(actor_id=current_user.id,action='CREATE_BANK',detail=f'{b.id} {name}'))
                 db.session.commit();flash('Bank created','success')
@@ -469,15 +642,16 @@ def create_app(test_config=None):
         day=selected_date()
         bank_page=max(1,request.args.get('bank_page',1,type=int))
         history_page=max(1,request.args.get('history_page',1,type=int))
-        bank_pagination=Bank.query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
+        bank_pagination=Bank.query.filter(platform_scope(Bank)).order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
         end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
-        history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
+        history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
         return render_template('banks.html',banks=bank_pagination.items,balances=balances(),
                                statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day)
 
     @app.post('/banks/<bank_id>/status')
     @role_required('admin','staff')
     def update_bank_status(bank_id):
+        bank_for_platform(bank_id,require_single_platform())
         new_status=request.form.get('status','').strip()
         remark=request.form.get('remark','').strip()
         if new_status not in BANK_STATUSES:
@@ -520,16 +694,17 @@ def create_app(test_config=None):
     def dealers():
         if request.method=='POST':
             if current_user.role!='admin': abort(403)
+            pid=require_single_platform()
             name=request.form.get('name','').strip()
             if not name: flash('Dealer name required','danger')
             else:
                 try:
-                    db.session.add(Dealer(name=name));db.session.commit();flash('Dealer added','success')
+                    db.session.add(Dealer(name=name,platform_id=pid));db.session.commit();flash('Dealer added','success')
                 except IntegrityError:
                     db.session.rollback();flash('Dealer already exists','danger')
             return redirect(url_for('banks') + '#add-dealer')
-        items=Dealer.query.order_by(Dealer.name).all()
-        rows=db.session.execute(select(DealerTrade.dealer_id,DealerTrade.flow,func.sum(DealerTrade.aud_amount),func.sum(DealerTrade.myr_delta)).join(Transaction,Transaction.id==DealerTrade.transaction_id).where(Transaction.status=='confirmed').group_by(DealerTrade.dealer_id,DealerTrade.flow)).all()
+        items=Dealer.query.filter(platform_scope(Dealer)).order_by(Dealer.name).all()
+        rows=db.session.execute(select(DealerTrade.dealer_id,DealerTrade.flow,func.sum(DealerTrade.aud_amount),func.sum(DealerTrade.myr_delta)).join(Transaction,Transaction.id==DealerTrade.transaction_id).where(Transaction.status=='confirmed',platform_scope(Transaction)).group_by(DealerTrade.dealer_id,DealerTrade.flow)).all()
         totals={}
         for did,flow,aud,myr in rows:
             d=totals.setdefault(did,{'dealer_sell':Decimal('0'),'dealer_buy':Decimal('0'),'dealer_payout':Decimal('0'),'myr':Decimal('0')})
@@ -540,25 +715,26 @@ def create_app(test_config=None):
     @login_required
     def new_transaction():
         if request.method=='POST':
+            pid=require_single_platform()
             try:
                 kind=request.form.get('kind','')
                 if kind in ('dealer_sell','dealer_buy','dealer_payout'):
                     record_dealer(kind,request.form.get('reference',''),request.form.get('amount',''),
                                   request.form.get('bank_id','') if kind!='dealer_payout' else None,
                                   current_user.id,request.form.get('dealer_id',''),request.form.get('rate',''),
-                                  request.form.get('customer_ref',''),request.form.get('remark',''))
+                                  request.form.get('customer_ref',''),request.form.get('remark',''),platform_id=pid)
                 else:
-                    record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None)
+                    record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None,platform_id=pid)
                 flash('Transaction confirmed and balance updated','success');return redirect(url_for('dashboard'))
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
-        return render_template('transaction.html',banks=Bank.query.filter_by(active=True).order_by(Bank.name).all(),dealers=Dealer.query.filter_by(active=True).order_by(Dealer.name).all())
+        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all())
 
     @app.get('/transactions')
     @login_required
     def transactions():
         from sqlalchemy import or_
         day = selected_date()
-        q = Transaction.query.filter(Transaction.business_date == day)
+        q = Transaction.query.filter(Transaction.business_date == day,platform_scope(Transaction))
         search = request.args.get('search', '').strip()
         kinds = [v for v in request.args.getlist('kind')
                  if v in ('deposit', 'withdrawal', 'transfer','dealer_sell','dealer_buy','dealer_payout')]
@@ -609,7 +785,7 @@ def create_app(test_config=None):
 
         return render_template('transactions.html', records=records,
                                transaction_banks=transaction_banks,
-                               banks=Bank.query.order_by(Bank.name).all(),
+                               banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all(),
                                search=search, kinds=kinds, bank_id=bank_id, selected_day=day)
 
     @app.route('/transactions/<transaction_id>/edit', methods=['GET','POST'])
@@ -617,6 +793,8 @@ def create_app(test_config=None):
     def edit_transaction(transaction_id):
         t=db.session.get(Transaction,transaction_id)
         if not t: abort(404)
+        require_platform(t.platform_id)
+        if request.method=='POST' and require_single_platform()!=t.platform_id:abort(403)
         if request.method=='GET':
             if t.kind.startswith('dealer_'):
                 flash('Dealer transactions require a controlled reversal; editing is disabled','warning')
@@ -627,11 +805,13 @@ def create_app(test_config=None):
             entries=Entry.query.filter_by(transaction_id=t.id).all()
             source=next((e for e in entries if e.delta<0),None) if t.kind=='transfer' else (entries[0] if entries else None)
             destination=next((e for e in entries if e.delta>0),None) if t.kind=='transfer' else None
-            return render_template('transaction_edit.html',t=t,banks=Bank.query.order_by(Bank.name).all(),source_id=source.bank_id if source else '',destination_id=destination.bank_id if destination else '')
+            return render_template('transaction_edit.html',t=t,banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all(),source_id=source.bank_id if source else '',destination_id=destination.bank_id if destination else '')
         try:
             # Serialize all edits/deletes of the same transaction.
             t=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
             if not t: abort(404)
+            require_platform(t.platform_id)
+            if require_single_platform()!=t.platform_id:abort(403)
             if t.kind.startswith('dealer_'): raise ValueError('Dealer transactions require an audited reversal; edit/void is disabled')
             if t.status!='confirmed': raise ValueError('Transaction already voided')
             if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be edited')
@@ -651,6 +831,7 @@ def create_app(test_config=None):
             if len(locked)!=len(affected): raise ValueError('Bank not found')
             if Closing.query.filter(Closing.bank_id.in_(affected),Closing.business_date==t.business_date).first():
                 raise ValueError('Cannot edit: an affected bank has been closed for this business date')
+            if any(b.platform_id!=t.platform_id for b in locked):abort(403)
             banks_by_id={b.id:b for b in locked}
             for bid in new_ids:
                 b=banks_by_id[bid]
@@ -690,6 +871,8 @@ def create_app(test_config=None):
         try:
             t=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
             if not t: abort(404)
+            require_platform(t.platform_id)
+            if require_single_platform()!=t.platform_id:abort(403)
             if t.kind.startswith('dealer_'): raise ValueError('Dealer transactions require an audited reversal; edit/void is disabled')
             if t.status!='confirmed': raise ValueError('Transaction already voided')
             if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be voided')
@@ -718,7 +901,8 @@ def create_app(test_config=None):
         today=business_today()
         if request.method=='POST':
             try:
-                bank_id=request.form.get('bank_id','');actual=money(request.form.get('actual',''))
+                pid=require_single_platform()
+                bank_id=request.form.get('bank_id','');bank_for_platform(bank_id,pid);actual=money(request.form.get('actual',''))
                 bs=lock_banks([bank_id]);
                 if len(bs)!=1: raise ValueError('Bank not found')
                 if Closing.query.filter_by(bank_id=bank_id,business_date=today).first(): raise ValueError('Already closed today')
@@ -729,14 +913,14 @@ def create_app(test_config=None):
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('closing'))
         day=selected_date()
-        closes_all=Closing.query.filter_by(business_date=day).all()
+        closes_all=Closing.query.filter(Closing.business_date==day,Closing.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).all()
         close_page=max(1,request.args.get('page',1,type=int))
-        close_pagination=Closing.query.filter_by(business_date=day).order_by(Closing.created_at.desc(),Closing.id.desc()).paginate(page=close_page,per_page=15,error_out=False)
-        return render_template('closing.html',banks=Bank.query.order_by(Bank.name).all(),balances=balances(),closes=close_pagination.items,close_pagination=close_pagination,closed_ids={c.bank_id for c in closes_all},selected_day=day,can_close=(day==today))
+        close_pagination=Closing.query.filter(Closing.business_date==day,Closing.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(Closing.created_at.desc(),Closing.id.desc()).paginate(page=close_page,per_page=15,error_out=False)
+        return render_template('closing.html',banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all(),balances=balances(),closes=close_pagination.items,close_pagination=close_pagination,closed_ids={c.bank_id for c in closes_all},selected_day=day,can_close=(day==today))
 
     @app.context_processor
     def inject_report_date():
-        return {'report_date': request.args.get('date', business_today().isoformat()), 'today_myt': business_today().isoformat()}
+        return {'report_date': request.args.get('date', business_today().isoformat()), 'today_myt': business_today().isoformat(), 'platform_options': Platform.query.filter(Platform.id.in_(permitted_platform_ids())).order_by(Platform.name).all() if current_user.is_authenticated else [], 'active_platform_id': session.get('platform_id','all' if current_user.is_authenticated and current_user.role=='admin' else ''), 'can': permitted if current_user.is_authenticated else lambda _:False}
 
     @app.get('/health')
     def health(): return {'status':'ok'}

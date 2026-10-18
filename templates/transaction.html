@@ -1,50 +1,70 @@
 {% extends 'base.html' %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
-  <div><h3 class="mb-1">Transaction Management</h3><div class="text-muted">Search, filter and review transactions</div></div>
-  <a class="btn btn-primary" href="{{ url_for('new_transaction') }}">+ New Transaction</a>
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div><h3 class="mb-1">New Transaction</h3><div class="text-muted">One form for customer, bank and dealer transactions</div></div>
+  <a class="btn btn-outline-secondary" href="{{ url_for('transactions') }}">Transaction History</a>
 </div>
-<div class="card p-3 p-lg-4">
-  <form method="get" action="{{ url_for('transactions') }}">
-    <input type="hidden" name="date" value="{{selected_day.isoformat()}}">
-    <div class="mb-3"><input class="form-control" name="search" value="{{ search }}" placeholder="Search customer, transaction ID or bank..." aria-label="Search transactions"></div>
-    <div class="d-flex flex-wrap gap-3 mb-3"><span class="fw-semibold">Types:</span>
-      {% for value,label in [('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer'),('dealer_sell','Sell AUD'),('dealer_buy','Buy AUD'),('dealer_payout','Dealer Payout')] %}
-      <label class="form-check"><input class="form-check-input" type="checkbox" name="kind" value="{{value}}" {% if value in kinds %}checked{% endif %}><span class="form-check-label">{{label}}</span></label>
-      {% endfor %}<span class="text-muted small">None checked = All types</span></div>
-    <div class="row g-2 align-items-center mb-3">
-      <div class="col-12 col-sm-6 col-lg-4"><select class="form-select" name="bank_id" aria-label="Filter by bank"><option value="">All Banks</option>{% for b in banks %}<option value="{{ b.id }}" {% if bank_id == b.id %}selected{% endif %}>{{ b.name }}</option>{% endfor %}</select></div>
-      <div class="col-auto"><button class="btn btn-primary" type="submit">Apply Filters</button></div>
-      <div class="col-auto"><a class="btn btn-outline-secondary" href="{{ url_for('transactions') }}">Reset</a></div>
-      <div class="col text-end text-muted small">{{ records.total }} records</div>
+<div class="card p-3 p-lg-4" style="max-width:820px">
+  <form method="post" id="newTransactionForm">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="row g-3">
+      <div class="col-12"><label class="form-label fw-semibold" for="kind">Transaction Type</label>
+        <select class="form-select" id="kind" name="kind" required>
+          <option value="deposit">Customer Deposit — Bank Received</option>
+          <option value="withdrawal">Customer Withdrawal — Bank Paid</option>
+          <option value="dealer_payout">Customer Withdrawal — Dealer Paid</option>
+          <option value="dealer_sell">Sell AUD — Bank to Dealer</option>
+          <option value="dealer_buy">Buy AUD — Dealer to Bank</option>
+          <option value="transfer">Bank to Bank Transfer</option>
+        </select>
+      </div>
+      <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="reference">Transaction ID / Reference</label><input class="form-control" id="reference" name="reference" maxlength="120" required placeholder="Unique reference"></div>
+      <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="amount">Amount (AUD)</label><input class="form-control" type="number" inputmode="decimal" id="amount" name="amount" min="0.01" step="0.01" required></div>
+      <div class="col-12 col-md-6" id="bankBlock"><label class="form-label fw-semibold" id="bankLabel" for="bank_id">Receiving Bank</label><select class="form-select" id="bank_id" name="bank_id"><option value="">Select bank</option>{% for bank in banks %}<option value="{{ bank.id }}">{{ bank.name }}</option>{% endfor %}</select></div>
+      <div class="col-12 col-md-6 d-none" id="toBankBlock"><label class="form-label fw-semibold" for="to_bank_id">Destination Bank</label><select class="form-select" id="to_bank_id" name="to_bank_id"><option value="">Select destination</option>{% for bank in banks %}<option value="{{ bank.id }}">{{ bank.name }}</option>{% endfor %}</select></div>
+      <div class="col-12 col-md-6 d-none" id="dealerBlock"><label class="form-label fw-semibold" for="dealer_id">Exchange Dealer</label><select class="form-select" id="dealer_id" name="dealer_id"><option value="">Select dealer</option>{% for dealer in dealers %}<option value="{{ dealer.id }}">{{ dealer.name }}</option>{% endfor %}</select></div>
+      <div class="col-12 col-md-6 d-none" id="rateBlock"><label class="form-label fw-semibold" for="rate">Exchange Rate (MYR / AUD)</label><input class="form-control" type="number" inputmode="decimal" id="rate" name="rate" min="0.000001" max="1000" step="0.000001" placeholder="2.790000"></div>
+      <div class="col-12 col-md-6" id="customerBlock"><label class="form-label fw-semibold" for="customer_ref">Customer ID</label><input class="form-control" id="customer_ref" name="customer_ref" maxlength="120"></div>
+      <div class="col-12"><label class="form-label fw-semibold" for="remark">Remark (optional)</label><textarea class="form-control" id="remark" name="remark" rows="2" maxlength="2000"></textarea></div>
     </div>
+    <div class="alert alert-light border mt-3 mb-3" id="impact" aria-live="polite"></div>
+    <button class="btn btn-primary" type="submit" id="submitBtn">Confirm Transaction</button>
+    <p class="text-muted small mt-2 mb-0">Submit only after payment is confirmed. Dealer-paid customer withdrawals do not change bank balances.</p>
   </form>
-  <div class="table-responsive">
-    <table class="table table-hover align-middle">
-      <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th class="text-end">Amount</th><th>Actions</th></tr></thead>
-      <tbody>
-      {% for t in records.items %}
-        <tr>
-          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }}</div>{% if t.status=='voided' %}<span class="badge bg-secondary">Voided</span>{% endif %}</td>
-          <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
-            {% if t.kind == 'deposit' %}<span class="badge bg-success">Deposit</span>
-            {% elif t.kind == 'withdrawal' %}<span class="badge bg-danger">Withdrawal</span>
-            {% elif t.kind=='dealer_sell' %}<span class="badge bg-warning text-dark">Sell AUD</span>{% elif t.kind=='dealer_buy' %}<span class="badge bg-info text-dark">Buy AUD</span>{% elif t.kind=='dealer_payout' %}<span class="badge bg-secondary">Dealer Paid Withdrawal</span>{% else %}<span class="badge bg-primary">Transfer</span>{% endif %}
-          </td>
-          <td class="text-end money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '')) }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}RM {{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and current_user.role in ('admin','staff') %}<div class="d-flex gap-1 flex-wrap"><a class="btn btn-sm btn-outline-primary" href="{{url_for('edit_transaction',transaction_id=t.id)}}">Edit</a><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
-        </tr>
-      {% else %}
-        <tr><td colspan="4" class="text-center text-muted py-4">No matching transactions</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  <div class="d-flex justify-content-between align-items-center gap-2">
-    <span class="small text-muted">Page {{ records.page }} / {{ records.pages or 1 }}</span>
-    <div class="d-flex gap-2">
-      {% if records.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.prev_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat()) }}">Previous</a>{% endif %}
-      {% if records.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.next_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat()) }}">Next</a>{% endif %}
-    </div>
-  </div>
 </div>
+<script>
+(function () {
+  const get = id => document.getElementById(id);
+  const kind=get('kind'), amount=get('amount'), rate=get('rate'), bank=get('bank_id'), toBank=get('to_bank_id'), dealer=get('dealer_id'), customer=get('customer_ref');
+  const dealerKinds=['dealer_sell','dealer_buy','dealer_payout'];
+  const money = n => Number.isFinite(n) ? n.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2}) : '0.00';
+  function refresh() {
+    const k=kind.value, isDealer=dealerKinds.includes(k), direct=k==='dealer_payout', transfer=k==='transfer';
+    get('bankBlock').classList.toggle('d-none',direct);
+    get('toBankBlock').classList.toggle('d-none',!transfer);
+    get('dealerBlock').classList.toggle('d-none',!isDealer);
+    get('rateBlock').classList.toggle('d-none',!isDealer);
+    get('customerBlock').classList.toggle('d-none',!['deposit','withdrawal','dealer_payout'].includes(k));
+    get('bankLabel').textContent=['deposit','dealer_buy'].includes(k)?'Receiving Bank':'Source Bank';
+    bank.required=!direct; toBank.required=transfer; dealer.required=isDealer; rate.required=isDealer; customer.required=direct;
+    if(direct) bank.value='';
+    if(!transfer) toBank.value='';
+    const aud=Number(amount.value)||0, fx=Number(rate.value)||0;
+    let bankImpact='No bank movement';
+    if(k==='deposit'||k==='dealer_buy') bankImpact='Bank +AUD '+money(aud);
+    else if(k==='withdrawal'||k==='dealer_sell') bankImpact='Bank −AUD '+money(aud);
+    else if(transfer) bankImpact='Source −AUD '+money(aud)+'; destination +AUD '+money(aud);
+    let msg='<strong>Impact Preview</strong><div>'+bankImpact+'</div>';
+    if(isDealer) msg+='<div>Dealer '+(k==='dealer_sell'?'MYR receivable':'MYR payable')+': RM '+money(aud*fx)+'</div>';
+    if(direct) msg+='<div>Customer Withdrawal: AUD '+money(aud)+' (Dealer paid)</div>';
+    get('impact').innerHTML=msg;
+  }
+  [kind,amount,rate].forEach(el=>el.addEventListener('input',refresh));
+  get('newTransactionForm').addEventListener('submit',function(e){
+    if(kind.value==='transfer'&&bank.value===toBank.value){e.preventDefault();alert('Choose two different bank accounts');return;}
+    if(!confirm('Confirm that this transaction has been completed and should be posted?'))e.preventDefault();
+  });
+  refresh();
+})();
+</script>
 {% endblock %}

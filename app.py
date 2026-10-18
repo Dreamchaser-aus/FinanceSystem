@@ -200,15 +200,93 @@ def create_app(test_config=None):
     @login_required
     def logout(): logout_user();return redirect(url_for('login'))
 
+    
     @app.get('/')
     @login_required
     def dashboard():
-        bs=Bank.query.order_by(Bank.kind,Bank.name).all();bal=balances()
-        today=business_today()
-        rows=db.session.execute(select(Transaction.kind,func.count(Transaction.id),func.coalesce(func.sum(Transaction.signed_amount),0)).where(Transaction.business_date==today).group_by(Transaction.kind)).all()
-        totals={k:{'count':n,'amount':money(v)} for k,n,v in rows}
-        latest=Transaction.query.order_by(Transaction.created_at.desc()).limit(12).all()
-        return render_template('dashboard.html',banks=bs,balances=bal,totals=totals,latest=latest,grand=sum(bal.values(),Decimal('0')))
+        bs = Bank.query.order_by(Bank.kind, Bank.name).all()
+        bal = balances()
+        today = business_today()
+
+        rows = db.session.execute(
+            select(
+                Transaction.kind,
+                func.count(Transaction.id),
+                func.coalesce(func.sum(Transaction.signed_amount), 0)
+            )
+            .where(Transaction.business_date == today)
+            .group_by(Transaction.kind)
+        ).all()
+
+        totals = {
+            k: {'count': n, 'amount': money(v)}
+            for k, n, v in rows
+        }
+
+        latest = (
+            Transaction.query
+            .order_by(Transaction.created_at.desc())
+            .limit(12)
+            .all()
+        )
+
+        # Find the bank account(s) for each transaction
+        transaction_ids = [t.id for t in latest]
+        transaction_banks = {}
+
+        if transaction_ids:
+            entries = (
+                db.session.query(Entry)
+                .filter(Entry.transaction_id.in_(transaction_ids))
+                .all()
+            )
+
+            bank_names = {b.id: b.name for b in bs}
+
+            grouped = {}
+            for entry in entries:
+                grouped.setdefault(
+                    entry.transaction_id, []
+                ).append(entry)
+
+            for t in latest:
+                items = grouped.get(t.id, [])
+
+                if t.kind == 'transfer':
+                    source = next(
+                        (e for e in items if e.delta < 0), None
+                    )
+                    destination = next(
+                        (e for e in items if e.delta > 0), None
+                    )
+
+                    from_name = (
+                        bank_names.get(source.bank_id, 'Unknown')
+                        if source else 'Unknown'
+                    )
+                    to_name = (
+                        bank_names.get(destination.bank_id, 'Unknown')
+                        if destination else 'Unknown'
+                    )
+
+                    transaction_banks[t.id] = (
+                        f'{from_name} → {to_name}'
+                    )
+                else:
+                    transaction_banks[t.id] = (
+                        bank_names.get(items[0].bank_id, 'Unknown')
+                        if items else 'Unknown'
+                    )
+
+        return render_template(
+            'dashboard.html',
+            banks=bs,
+            balances=bal,
+            totals=totals,
+            latest=latest,
+            transaction_banks=transaction_banks,
+            grand=sum(bal.values(), Decimal('0'))
+        )
 
     @app.route('/banks',methods=['GET','POST'])
     @login_required

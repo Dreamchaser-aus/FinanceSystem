@@ -1,1 +1,26 @@
-{% extends 'base.html' %}{% block content %}<h3>Bank Accounts</h3>{% if current_user.role=='admin' %}<div class="card p-3 mb-3"><h5>Add Bank</h5><form method="post" class="row g-2"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><div class="col-lg-4"><input class="form-control" name="name" placeholder="Bank display name" required maxlength="120"></div><div class="col-lg-3"><select class="form-select" name="kind"><option value="deposit">Deposit</option><option value="withdrawal">Withdrawal</option><option value="store">Store</option><option value="other">Other</option></select></div><div class="col-lg-3"><input class="form-control" name="opening_balance" type="number" step="0.01" value="0.00" required></div><div class="col-lg-2"><button class="btn btn-primary w-100">Create</button></div></form><small class="text-muted mt-2">Opening balance can be negative for legacy migration. This form is intended for initial setup, not daily balance adjustment.</small></div>{% endif %}<div class="card p-3"><div class="table-responsive"><table class="table"><thead><tr><th>Name</th><th>Group</th><th class="text-end">Opening</th><th class="text-end">Current</th></tr></thead><tbody>{% for b in banks %}<tr><td>{{b.name}}</td><td>{{b.kind}}</td><td class="text-end">{{b.opening_balance|rm}}</td><td class="text-end">{{balances[b.id]|rm}}</td></tr>{% endfor %}</tbody></table></div></div>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3"><h3 class="mb-0">Bank Status Management</h3></div>
+{% if current_user.role=='admin' %}
+<div class="card p-3 mb-3"><h5>Add Bank</h5>
+<form method="post" class="row g-2"><input type="hidden" name="csrf_token" value="{{csrf_token()}}">
+<div class="col-lg-4"><input class="form-control" name="name" placeholder="Bank display name" required maxlength="120"></div>
+<div class="col-lg-3"><select class="form-select" name="kind"><option value="deposit">Deposit</option><option value="withdrawal">Withdrawal</option><option value="store">Store</option><option value="other">Other</option></select></div>
+<div class="col-lg-3"><input class="form-control" name="opening_balance" type="number" step="0.01" value="0.00" required></div>
+<div class="col-lg-2"><button class="btn btn-primary w-100">Create Bank</button></div></form></div>
+{% endif %}
+<div class="card p-3 mb-3"><h5>Bank Accounts</h5><div class="table-responsive"><table class="table table-hover align-middle">
+<thead><tr><th>Bank</th><th>Group</th><th class="text-end">Current (RM)</th><th>Status</th><th>Remark</th><th>Last Updated (MYT)</th><th>Action</th></tr></thead><tbody>
+{% for b in banks %}<tr><td>{{b.name}}</td><td>{{b.kind|title}}</td><td class="text-end">{{balances[b.id]|rm}}</td>
+<td>{% set label=statuses.get(b.status,b.status) %}<span class="badge {% if b.status=='active' %}bg-success{% elif b.status=='closed' or b.status=='wrong_password' %}bg-danger{% else %}bg-warning text-dark{% endif %}">{{label}}</span></td>
+<td style="min-width:150px">{{b.status_remark or '—'}}</td><td>{{b.status_updated_at|mytime if b.status_updated_at else '—'}}</td>
+<td><button class="btn btn-sm btn-outline-primary" data-bs-toggle="collapse" data-bs-target="#edit-{{b.id}}" type="button">Update Status</button></td></tr>
+<tr class="collapse" id="edit-{{b.id}}"><td colspan="7"><form method="post" action="{{url_for('update_bank_status',bank_id=b.id)}}" class="row g-2 align-items-end p-2 bg-light rounded">
+<input type="hidden" name="csrf_token" value="{{csrf_token()}}"><div class="col-md-4"><label class="form-label">New Status</label><select name="status" class="form-select" required>{% for value,label in statuses.items() %}<option value="{{value}}" {% if b.status==value %}selected{% endif %}>{{label}}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">Reason / Remark (required for issues)</label><textarea name="remark" class="form-control" rows="2" maxlength="2000">{{b.status_remark or ''}}</textarea></div>
+<div class="col-md-2"><button class="btn btn-primary w-100" type="submit">Save</button></div></form></td></tr>
+{% else %}<tr><td colspan="7" class="text-muted text-center">No bank accounts</td></tr>{% endfor %}</tbody></table></div></div>
+<div class="card p-3"><h5>Recent Status Changes</h5><div class="table-responsive"><table class="table table-sm"><thead><tr><th>Time (MYT)</th><th>Bank</th><th>Updated By</th><th>Old</th><th>New</th><th>Reason</th></tr></thead><tbody>
+{% for h in history %}<tr><td>{{h.created_at|mytime}}</td><td>{{h.bank.name}}</td><td>{{h.actor.username}}</td><td>{{statuses.get(h.old_status,h.old_status)}}</td><td>{{statuses.get(h.new_status,h.new_status)}}</td><td>{{h.remark or '—'}}</td></tr>
+{% else %}<tr><td colspan="6" class="text-center text-muted">No status changes yet</td></tr>{% endfor %}</tbody></table></div></div>
+{% endblock %}

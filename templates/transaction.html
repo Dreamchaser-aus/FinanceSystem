@@ -1,14 +1,50 @@
-{% extends 'base.html' %}{% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3"><h3>Edit Transaction</h3><a class="btn btn-outline-secondary" href="{{url_for('transactions')}}">Back</a></div>
-<div class="alert alert-warning">Editing a transaction recalculates bank balances. Transactions on closed business dates or involving banks already closed for the day cannot be edited.</div>
-<div class="card p-3"><form method="post"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><div class="row g-3">
-<div class="col-md-4"><label class="form-label">Type</label><select class="form-select" name="kind" id="kind" onchange="toggleTransfer()" required>{% for v in ['deposit','withdrawal','transfer'] %}<option value="{{v}}" {% if t.kind==v %}selected{% endif %}>{{v|title}}</option>{% endfor %}</select></div>
-<div class="col-md-4"><label class="form-label">Transaction ID</label><input class="form-control" name="reference" value="{{t.reference}}" maxlength="120" required></div>
-<div class="col-md-4"><label class="form-label">Amount (RM)</label><input class="form-control" type="number" step="0.01" min="0.01" name="amount" value="{{t.signed_amount|abs}}" required></div>
-<div class="col-md-6"><label class="form-label">Bank Account (Deposit / Withdrawal / From)</label><select class="form-select" name="bank_id" required>{% for b in banks %}<option value="{{b.id}}" {% if b.id==source_id %}selected{% endif %}>{{b.name}} — {{b.status}}</option>{% endfor %}</select></div>
-<div class="col-md-6" id="destination"><label class="form-label">To Bank (Transfer)</label><select class="form-select" name="to_bank_id"><option value="">Choose bank</option>{% for b in banks %}<option value="{{b.id}}" {% if b.id==destination_id %}selected{% endif %}>{{b.name}} — {{b.status}}</option>{% endfor %}</select></div>
-<div class="col-md-6"><label class="form-label">Customer Name</label><input class="form-control" name="customer_ref" value="{{t.customer_ref or ''}}" maxlength="120"></div>
-<div class="col-12"><label class="form-label">Remark</label><textarea class="form-control" name="remark" maxlength="2000" rows="3">{{t.remark or ''}}</textarea></div>
-<div class="col-12"><button class="btn btn-primary" onclick="return confirm('Save changes and recalculate balances?')">Save Changes</button></div></div></form></div>
-<script>function toggleTransfer(){document.getElementById('destination').style.display=document.getElementById('kind').value==='transfer'?'':'none'}toggleTransfer();</script>
+{% extends 'base.html' %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+  <div><h3 class="mb-1">Transaction Management</h3><div class="text-muted">Search, filter and review transactions</div></div>
+  <a class="btn btn-primary" href="{{ url_for('new_transaction') }}">+ New Transaction</a>
+</div>
+<div class="card p-3 p-lg-4">
+  <form method="get" action="{{ url_for('transactions') }}">
+    <input type="hidden" name="date" value="{{selected_day.isoformat()}}">
+    <div class="mb-3"><input class="form-control" name="search" value="{{ search }}" placeholder="Search customer, transaction ID or bank..." aria-label="Search transactions"></div>
+    <div class="d-flex flex-wrap gap-3 mb-3"><span class="fw-semibold">Types:</span>
+      {% for value,label in [('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer'),('dealer_sell','Sell AUD'),('dealer_buy','Buy AUD'),('dealer_payout','Dealer Payout')] %}
+      <label class="form-check"><input class="form-check-input" type="checkbox" name="kind" value="{{value}}" {% if value in kinds %}checked{% endif %}><span class="form-check-label">{{label}}</span></label>
+      {% endfor %}<span class="text-muted small">None checked = All types</span></div>
+    <div class="row g-2 align-items-center mb-3">
+      <div class="col-12 col-sm-6 col-lg-4"><select class="form-select" name="bank_id" aria-label="Filter by bank"><option value="">All Banks</option>{% for b in banks %}<option value="{{ b.id }}" {% if bank_id == b.id %}selected{% endif %}>{{ b.name }}</option>{% endfor %}</select></div>
+      <div class="col-auto"><button class="btn btn-primary" type="submit">Apply Filters</button></div>
+      <div class="col-auto"><a class="btn btn-outline-secondary" href="{{ url_for('transactions') }}">Reset</a></div>
+      <div class="col text-end text-muted small">{{ records.total }} records</div>
+    </div>
+  </form>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle">
+      <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th class="text-end">Amount</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for t in records.items %}
+        <tr>
+          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }}</div>{% if t.status=='voided' %}<span class="badge bg-secondary">Voided</span>{% endif %}</td>
+          <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
+            {% if t.kind == 'deposit' %}<span class="badge bg-success">Deposit</span>
+            {% elif t.kind == 'withdrawal' %}<span class="badge bg-danger">Withdrawal</span>
+            {% elif t.kind=='dealer_sell' %}<span class="badge bg-warning text-dark">Sell AUD</span>{% elif t.kind=='dealer_buy' %}<span class="badge bg-info text-dark">Buy AUD</span>{% elif t.kind=='dealer_payout' %}<span class="badge bg-secondary">Dealer Paid Withdrawal</span>{% else %}<span class="badge bg-primary">Transfer</span>{% endif %}
+          </td>
+          <td class="text-end money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '')) }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}RM {{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and current_user.role in ('admin','staff') %}<div class="d-flex gap-1 flex-wrap"><a class="btn btn-sm btn-outline-primary" href="{{url_for('edit_transaction',transaction_id=t.id)}}">Edit</a><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="text-center text-muted py-4">No matching transactions</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="d-flex justify-content-between align-items-center gap-2">
+    <span class="small text-muted">Page {{ records.page }} / {{ records.pages or 1 }}</span>
+    <div class="d-flex gap-2">
+      {% if records.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.prev_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat()) }}">Previous</a>{% endif %}
+      {% if records.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.next_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat()) }}">Next</a>{% endif %}
+    </div>
+  </div>
+</div>
 {% endblock %}

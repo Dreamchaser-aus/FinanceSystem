@@ -1,1 +1,50 @@
-{% extends 'base.html' %}{% block content %}<h3>Transaction History</h3><form method="get" class="d-flex gap-2 mb-3"><input class="form-control" name="reference" placeholder="Search Transaction ID" value="{{request.args.get('reference','')}}"><button class="btn btn-primary">Search</button></form><div class="card p-3"><div class="table-responsive"><table class="table table-sm"><thead><tr><th>Time (MYT)</th><th>Reference</th><th>Type</th><th>Customer</th><th class="text-end">Signed Amount</th><th>Remark</th></tr></thead><tbody>{% for t in records.items %}<tr><td>{{t.created_at|mytime}}</td><td>{{t.reference}}</td><td>{{t.kind}}</td><td>{{t.customer_ref or ''}}</td><td class="text-end">{{t.signed_amount|rm}}</td><td>{{t.remark or ''}}</td></tr>{% endfor %}</tbody></table></div><div class="d-flex justify-content-between"><span>Page {{records.page}} / {{records.pages or 1}}</span><div>{% if records.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('transactions',page=records.prev_num,reference=request.args.get('reference',''))}}">Previous</a>{% endif %}{% if records.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('transactions',page=records.next_num,reference=request.args.get('reference',''))}}">Next</a>{% endif %}</div></div></div>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+  <div><h3 class="mb-1">Transaction Management</h3><div class="text-muted">Search, filter and review transactions</div></div>
+  <a class="btn btn-primary" href="{{ url_for('new_transaction') }}">+ New Transaction</a>
+</div>
+<div class="card p-3 p-lg-4">
+  <form method="get" action="{{ url_for('transactions') }}">
+    <div class="mb-3"><input class="form-control" name="search" value="{{ search }}" placeholder="Search customer, transaction ID or bank..." aria-label="Search transactions"></div>
+    <div class="d-flex flex-wrap gap-2 mb-3">
+      {% for value, label in [('all','All'),('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer')] %}
+        <a class="btn btn-sm {{ 'btn-primary' if kind == value else 'btn-outline-secondary' }}" href="{{ url_for('transactions', search=search, kind=value, bank_id=bank_id) }}">{{ label }}</a>
+      {% endfor %}
+    </div>
+    <div class="row g-2 align-items-center mb-3">
+      <div class="col-12 col-sm-6 col-lg-4"><select class="form-select" name="bank_id" aria-label="Filter by bank"><option value="">All Banks</option>{% for b in banks %}<option value="{{ b.id }}" {% if bank_id == b.id %}selected{% endif %}>{{ b.name }}</option>{% endfor %}</select></div>
+      <div class="col-auto"><button class="btn btn-primary" type="submit">Apply Filters</button></div>
+      <div class="col-auto"><a class="btn btn-outline-secondary" href="{{ url_for('transactions') }}">Reset</a></div>
+      <div class="col text-end text-muted small">{{ records.total }} records</div>
+    </div>
+  </form>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle">
+      <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th class="text-end">Amount</th></tr></thead>
+      <tbody>
+      {% for t in records.items %}
+        <tr>
+          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} MYT</div></td>
+          <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
+            {% if t.kind == 'deposit' %}<span class="badge bg-success">Deposit</span>
+            {% elif t.kind == 'withdrawal' %}<span class="badge bg-danger">Withdrawal</span>
+            {% else %}<span class="badge bg-primary">Transfer</span>{% endif %}
+          </td>
+          <td class="text-end money text-nowrap fw-semibold {{ 'text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '') }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}RM {{ t.signed_amount|abs|rm }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="text-center text-muted py-4">No matching transactions</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="d-flex justify-content-between align-items-center gap-2">
+    <span class="small text-muted">Page {{ records.page }} / {{ records.pages or 1 }}</span>
+    <div class="d-flex gap-2">
+      {% if records.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.prev_num,search=search,kind=kind,bank_id=bank_id) }}">Previous</a>{% endif %}
+      {% if records.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.next_num,search=search,kind=kind,bank_id=bank_id) }}">Next</a>{% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

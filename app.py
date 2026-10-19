@@ -721,10 +721,10 @@ def create_app(test_config=None):
         bal = balances_through(day)
         unclaimed_components = unclaimed_balance_components([b.id for b in existing], day)
         display_bal = {b.id: bal[b.id] + unclaimed_components.get(b.id, Decimal('0.00')) for b in existing}
-        dashboard_bank_stats = bank_daily_overview(active_banks, day)
         # "Bank Block" means status=closed; other issues remain in the closing total.
         blocked = [b for b in existing if statuses[b.id] == 'closed']
         active_banks = [b for b in existing if statuses[b.id] == 'active']
+        dashboard_bank_stats = bank_daily_overview(active_banks, day)
         closing_total = sum((display_bal[b.id] for b in existing if statuses[b.id] != 'closed'), Decimal('0'))
         active_total = sum((display_bal[b.id] for b in active_banks), Decimal('0'))
         start = (bank_page - 1) * 10

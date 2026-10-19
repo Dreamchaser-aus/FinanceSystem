@@ -13,7 +13,7 @@
 <td class="text-end money fw-bold text-primary">{{v.current|rm}}</td>
 <td class="text-end"><span class="text-success">{{v.in_count}}</span><div class="text-muted small">{{v.in_amount|rm}}</div></td>
 <td class="text-end"><span class="text-danger">{{v.out_count}}</span><div class="text-muted small">{{v.out_amount|rm}}</div></td>
-<td>{% if can('view_bank_movements') %}<a class="btn btn-sm btn-outline-secondary" href="{{url_for('new_transaction',movement_bank=b.id)}}#latest-transactions">History</a>{% else %}—{% endif %}</td>
+<td>{% if can('view_bank_movements') %}<a class="btn btn-sm btn-outline-secondary" href="{{url_for('bank_investigation',bank_id=b.id)}}">History</a>{% else %}—{% endif %}</td>
 </tr>
 {% else %}<tr><td colspan="8" class="text-muted">No banks in this platform.</td></tr>{% endfor %}
 </tbody></table></div>

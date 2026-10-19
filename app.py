@@ -92,8 +92,8 @@ def require_permission(permission):
 
 def permitted_platform_ids():
     if current_user.role=='admin':
-        return set(db.session.execute(select(Platform.id)).scalars().all())
-    return set(db.session.execute(select(UserPlatformAccess.platform_id).where(UserPlatformAccess.user_id==current_user.id)).scalars().all())
+        return set(db.session.execute(select(Platform.id).where(Platform.active.is_(True))).scalars().all())
+    return set(db.session.execute(select(UserPlatformAccess.platform_id).join(Platform,Platform.id==UserPlatformAccess.platform_id).where(UserPlatformAccess.user_id==current_user.id,Platform.active.is_(True))).scalars().all())
 
 def selected_platform_id():
     """Fail closed for staff. Admin may choose All Platforms only for read-only reports."""
@@ -470,7 +470,7 @@ def create_app(test_config=None):
         if pid=='all' and current_user.role=='admin':pass
         elif pid not in permitted_platform_ids():abort(403)
         session['platform_id']=pid
-        return redirect(url_for('dashboard'))
+        return redirect(request.referrer if request.referrer and request.referrer.startswith(request.host_url) else url_for('new_transaction') if permitted('create_transaction') and current_user.role!='admin' else url_for('dashboard'))
 
     @app.route('/admin/platforms',methods=['GET','POST'])
     @role_required('admin')
@@ -487,6 +487,27 @@ def create_app(test_config=None):
                 except IntegrityError:db.session.rollback();flash('Platform already exists','danger')
             return redirect(url_for('manage_platforms'))
         return render_template('platforms.html',platforms=Platform.query.order_by(Platform.name).all())
+
+    @app.post('/admin/platforms/<pid>/update')
+    @role_required('admin')
+    def update_platform(pid):
+        obj=db.session.get(Platform,pid)
+        if not obj: abort(404)
+        name=request.form.get('name','').strip()[:120]
+        active=request.form.get('active')=='1'
+        if not name:
+            flash('Platform name is required','danger')
+            return redirect(url_for('manage_platforms'))
+        try:
+            previous=f'{obj.name} active={obj.active}'
+            obj.name=name;obj.active=active
+            db.session.add(Audit(actor_id=current_user.id,action='UPDATE_PLATFORM',detail=f'{obj.id} {previous} -> {name} active={active}'))
+            db.session.commit()
+            if not active and session.get('platform_id')==pid:session['platform_id']='all'
+            flash('Platform updated','success')
+        except IntegrityError:
+            db.session.rollback();flash('Platform name already exists','danger')
+        return redirect(url_for('manage_platforms'))
 
     @app.route('/admin/staff',methods=['GET','POST'])
     @role_required('admin')
@@ -542,7 +563,7 @@ def create_app(test_config=None):
                 login_user(u)
                 ids=permitted_platform_ids()
                 session['platform_id']='all' if u.role=='admin' else (sorted(ids)[0] if ids else '')
-                return redirect(url_for('dashboard') if u.role=='admin' else url_for('workspace') if permitted('view_bank_balances') else url_for('new_transaction') if permitted('create_transaction') else url_for('transactions') if permitted('view_transactions') else url_for('dashboard'))
+                return redirect(url_for('dashboard') if u.role=='admin' else url_for('new_transaction') if permitted('create_transaction') else url_for('workspace') if permitted('view_bank_balances') else url_for('transactions') if permitted('view_transactions') else url_for('dashboard'))
             flash('Invalid credentials','danger')
         return render_template('login.html')
 
@@ -754,9 +775,21 @@ def create_app(test_config=None):
                                   request.form.get('customer_ref',''),request.form.get('remark',''),platform_id=pid)
                 else:
                     record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None,platform_id=pid)
-                flash('Transaction confirmed and balance updated','success');return redirect(url_for('workspace') if permitted('view_bank_balances') else url_for('dashboard') if permitted('view_dashboard') else url_for('new_transaction'))
+                flash('Transaction confirmed and balance updated','success');return redirect(url_for('new_transaction'))
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
-        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all())
+        
+        balance_banks=[];balance_values={};recent=[]
+        if permitted('view_bank_balances'):
+            balance_banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
+            balance_values={b.id:ledger_balance(b.id) for b in balance_banks}
+            bank_ids=[b.id for b in balance_banks]
+            if permitted('view_bank_movements') and bank_ids:
+                recent=db.session.execute(select(Entry,Transaction,Bank.name)
+                    .join(Transaction,Transaction.id==Entry.transaction_id)
+                    .join(Bank,Bank.id==Entry.bank_id)
+                    .where(Entry.bank_id.in_(bank_ids),Transaction.status=='confirmed',platform_scope(Transaction))
+                    .order_by(Transaction.created_at.desc()).limit(20)).all()
+        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,recent=recent)
 
     @app.get('/workspace')
     @login_required
@@ -1018,7 +1051,7 @@ def create_app(test_config=None):
 
     @app.context_processor
     def inject_report_date():
-        return {'report_date': request.args.get('date', business_today().isoformat()), 'today_myt': business_today().isoformat(), 'platform_options': Platform.query.filter(Platform.id.in_(permitted_platform_ids())).order_by(Platform.name).all() if current_user.is_authenticated else [], 'active_platform_id': session.get('platform_id','all' if current_user.is_authenticated and current_user.role=='admin' else ''), 'can': permitted if current_user.is_authenticated else lambda _:False}
+        return {'report_date': request.args.get('date', business_today().isoformat()), 'today_myt': business_today().isoformat(), 'platform_options': Platform.query.filter(Platform.id.in_(permitted_platform_ids()),Platform.active.is_(True)).order_by(Platform.name).all() if current_user.is_authenticated else [], 'active_platform_id': session.get('platform_id','all' if current_user.is_authenticated and current_user.role=='admin' else ''), 'can': permitted if current_user.is_authenticated else lambda _:False}
 
     @app.get('/health')
     def health(): return {'status':'ok'}

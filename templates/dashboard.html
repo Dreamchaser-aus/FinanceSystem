@@ -2,12 +2,35 @@
 {% block content %}
 <div class="d-flex justify-content-between align-items-center flex-wrap mb-3"><h3>Financial Dashboard</h3><span class="badge bg-primary">{{selected_day}} · MYT</span></div>
 <div class="d-flex flex-wrap align-items-center gap-2 mb-3"><form method="get" action="{{url_for('dashboard')}}" class="d-flex flex-wrap align-items-center gap-2"><span class="small text-muted">Date range</span><input class="form-control form-control-sm" style="width:148px" aria-label="From date" type="date" name="start_date" value="{{start_day.isoformat()}}" max="{{today_myt}}" required><span class="text-muted">–</span><input class="form-control form-control-sm" style="width:148px" aria-label="To date" type="date" name="end_date" value="{{selected_day.isoformat()}}" max="{{today_myt}}" required><button class="btn btn-sm btn-primary">Apply</button><a class="btn btn-sm btn-outline-secondary" href="{{url_for('dashboard')}}">Today</a></form><small class="text-muted">Balances as of end date · MYT</small></div>
-{% if can("view_dashboard_customers") or can("view_dashboard_financials") %}<div class="row g-3 mb-3">{% if can("view_dashboard_customers") %}<div class="col-6 col-xl-3"><div class="card p-3"><small>Active Customers</small><h4>{{active_customers}}</h4><small>Unique customer IDs</small></div></div><div class="col-6 col-xl-3"><div class="card p-3"><small>New Customers</small><h4>{{new_customers}}</h4><small>First confirmed activity in range</small></div></div>
-{% endif %}{% if can("view_dashboard_financials") %}{% for key,title in [('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer')] %}<div class="col-6 col-xl-3"><div class="card p-3"><small>{{title}} (Selected Range)</small><h4>AUD {{(totals.get(key,{}).get('amount',0) + (totals.get('dealer_payout',{}).get('amount',0) if key=='withdrawal' else 0))|abs|rm}}</h4><small>{{totals.get(key,{}).get('count',0) + (totals.get('dealer_payout',{}).get('count',0) if key=='withdrawal' else 0)}} records</small></div></div>{% endfor %}
-<div class="col-6 col-xl-3"><div class="card p-3"><small>Total Bank Block (Closed Status)</small><h4>{{block_count}}</h4><small>Excluded from Closing Total</small></div></div>
-<div class="col-12 col-lg-6"><div class="card p-3"><small>Total Bank Balance (Closing)</small><h3 class="money">AUD {{closing_total|rm}}</h3><small class="text-muted">Confirmed ledger only; excludes Unclaimed and Closed/Blocked banks</small></div></div>
-<div class="col-12 col-lg-6"><div class="card p-3"><small>Total Active Bank Balance</small><h3 class="money">AUD {{active_with_unclaimed|rm}}</h3><small>{{active_count}} active banks · includes Unclaimed (AUD {{total_unclaimed|rm}})</small></div></div>
-{% endif %}</div>{% endif %}
+<style>
+.bf-kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}
+.bf-kpi{min-width:0;min-height:96px;padding:13px 15px;background:#fff;border:1px solid #e2eaf3;border-radius:13px;box-shadow:0 2px 10px rgba(18,49,83,.035);display:flex;flex-direction:column;justify-content:space-between}
+.bf-kpi-head{display:flex;align-items:center;justify-content:space-between;gap:6px;color:#60718a;font-size:12px;font-weight:600;line-height:1.3}
+.bf-kpi-icon{width:26px;height:26px;flex:0 0 26px;display:grid;place-items:center;border-radius:8px;background:#eff5ff;color:#336bd4;font-size:14px}
+.bf-kpi-value{font-size:clamp(18px,1.65vw,24px);line-height:1.2;font-weight:780;letter-spacing:-.5px;color:#182b43;font-variant-numeric:tabular-nums;white-space:nowrap}
+.bf-kpi-foot{font-size:11px;color:#8290a3;line-height:1.25;margin-top:4px}
+.bf-kpi-totals{grid-column:span 2;min-height:105px;background:linear-gradient(115deg,#f9fbff,#edf4ff);border-color:#d7e5f8}
+.bf-kpi-totals .bf-kpi-value{font-size:clamp(22px,2.2vw,31px)}
+.bf-kpi-totals.active{background:linear-gradient(115deg,#f4faff,#e7f4ff);border-color:#c9e3f5}
+@media(max-width:1100px){.bf-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bf-kpi-totals{grid-column:span 1}}
+@media(max-width:575px){.bf-kpi-grid{gap:8px}.bf-kpi{padding:11px;min-height:90px}.bf-kpi-value{font-size:18px}.bf-kpi-totals .bf-kpi-value{font-size:20px}.bf-kpi-head{font-size:11px}.bf-kpi-icon{width:22px;height:22px;flex-basis:22px}.bf-kpi-foot{font-size:10px}}
+</style>
+{% if can("view_dashboard_customers") or can("view_dashboard_financials") %}
+<section class="bf-kpi-grid" aria-label="Dashboard statistics">
+{% if can("view_dashboard_customers") %}
+<div class="bf-kpi"><div class="bf-kpi-head"><span>Active Customers</span><span class="bf-kpi-icon">♙</span></div><div class="bf-kpi-value">{{active_customers}}</div><div class="bf-kpi-foot">Unique customer IDs</div></div>
+<div class="bf-kpi"><div class="bf-kpi-head"><span>New Customers</span><span class="bf-kpi-icon">＋</span></div><div class="bf-kpi-value">{{new_customers}}</div><div class="bf-kpi-foot">First activity in range</div></div>
+{% endif %}
+{% if can("view_dashboard_financials") %}
+{% for key,title,mark in [('deposit','Deposit','↙'),('withdrawal','Withdrawal','↗'),('transfer','Transfer','⇄')] %}
+<div class="bf-kpi"><div class="bf-kpi-head"><span>{{title}}</span><span class="bf-kpi-icon">{{mark}}</span></div><div class="bf-kpi-value money">AUD {{(totals.get(key,{}).get('amount',0) + (totals.get('dealer_payout',{}).get('amount',0) if key=='withdrawal' else 0))|abs|rm}}</div><div class="bf-kpi-foot">{{totals.get(key,{}).get('count',0) + (totals.get('dealer_payout',{}).get('count',0) if key=='withdrawal' else 0)}} records · selected range</div></div>
+{% endfor %}
+<div class="bf-kpi"><div class="bf-kpi-head"><span>Blocked Banks</span><span class="bf-kpi-icon">⊘</span></div><div class="bf-kpi-value">{{block_count}}</div><div class="bf-kpi-foot">Excluded from closing</div></div>
+<div class="bf-kpi bf-kpi-totals"><div class="bf-kpi-head"><span>Total Bank Balance (Closing)</span><span class="bf-kpi-icon">▤</span></div><div class="bf-kpi-value money">AUD {{closing_total|rm}}</div><div class="bf-kpi-foot">Confirmed ledger · excludes Unclaimed and Blocked</div></div>
+<div class="bf-kpi bf-kpi-totals active"><div class="bf-kpi-head"><span>Total Active Bank Balance</span><span class="bf-kpi-icon">◈</span></div><div class="bf-kpi-value money">AUD {{active_with_unclaimed|rm}}</div><div class="bf-kpi-foot">{{active_count}} active banks · includes Unclaimed AUD {{total_unclaimed|rm}}</div></div>
+{% endif %}
+</section>
+{% endif %}
 {% if can("view_bank_balances") %}<div class="card p-3 mb-3"><h5>Active Bank Balances</h5><p class="small text-muted">Opening and IN/OUT use the selected report end date. Before Unclaimed is confirmed ledger only; With Unclaimed is for bank-app comparison. Historical Unclaimed status is based on current status.</p><div class="table-responsive"><table class="table table-hover"><thead><tr><th>Bank</th><th>Group</th><th class="text-end">Opening</th><th class="text-end">IN (Count / AUD)</th><th class="text-end">OUT (Count / AUD)</th><th class="text-end">Before Unclaimed</th><th class="text-end">Unclaimed</th><th class="text-end">With Unclaimed</th></tr></thead><tbody>{% for b in banks %}<tr><td>{{b.name}}</td><td>{{b.kind|title}}</td>
 <td class="text-end">{{dashboard_bank_stats[b.id].opening|rm}}</td>
 <td class="text-end text-success">{{dashboard_bank_stats[b.id].in_count}}<div class="small">{{dashboard_bank_stats[b.id].in_amount|rm}}</div></td>

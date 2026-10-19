@@ -346,6 +346,14 @@ class Closing(db.Model):
     __table_args__=(UniqueConstraint('bank_id','business_date',name='uq_bank_date'),)
     bank=db.relationship('Bank')
 
+class BusinessTimezoneChange(db.Model):
+    """Append-only timezone policy; timestamps before each change keep their prior GMT offset."""
+    __tablename__='business_timezone_change'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    effective_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now,index=True)
+    offset_minutes=db.Column(db.Integer,nullable=False)
+    actor_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
+
 class Audit(db.Model):
     id=db.Column(db.String(36),primary_key=True,default=idgen)
     actor_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
@@ -408,7 +416,31 @@ def ledger_balance(bank_id,through=None):
     bank=db.session.get(Bank,bank_id)
     return money(bank.opening_balance)+money(db.session.execute(q).scalar_one())
 
-def business_today(): return datetime.now(MYT).date()
+def timezone_at(instant=None):
+    """Resolve offset from append-only policy; earlier timestamps never change display."""
+    instant=instant or now()
+    if instant.tzinfo is None:instant=instant.replace(tzinfo=timezone.utc)
+    try:
+        row=(BusinessTimezoneChange.query.filter(BusinessTimezoneChange.effective_at<=instant)
+             .order_by(BusinessTimezoneChange.effective_at.desc()).first())
+        if row:return timezone(timedelta(minutes=row.offset_minutes))
+    except Exception:
+        # Used before the initial migration in startup paths only.
+        pass
+    return MYT
+
+def timezone_for_report_day(day):
+    """Offset active at the end of the selected calendar day; previous days retain their policy."""
+    end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=timezone.utc)
+    return timezone_at(end)
+
+def business_today(): return now().astimezone(timezone_at()).date()
+
+def format_business_time(d):
+    if not d:return ''
+    if d.tzinfo is None:d=d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone_at(d)).strftime('%Y-%m-%d %H:%M')
+
 
 def validate_entry_business_day(value):
     """Only MYT today/yesterday are permitted; enforced server-side."""
@@ -460,7 +492,7 @@ def bank_status_on(bank, day, history_by_bank):
     changes = history_by_bank.get(bank.id, [])
     if not changes:
         return bank.status
-    day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=MYT).astimezone(timezone.utc)
+    day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=timezone_for_report_day(day)).astimezone(timezone.utc)
     for h in reversed(changes):
         if h.created_at.astimezone(timezone.utc) < day_end:
             return h.new_status
@@ -491,7 +523,7 @@ def unclaimed_balance_components(bank_ids, day=None):
         created=lead.created_at
         if day is not None and created is not None:
             if created.tzinfo is None: created=created.replace(tzinfo=timezone.utc)
-            if created.astimezone(MYT).date()>day: continue
+            if created.astimezone(timezone_at(created)).date()>day: continue
         result[lead.bank_id]+=money(lead.amount)
     return result
 
@@ -647,7 +679,7 @@ def create_app(test_config=None):
     if not app.config['TESTING'] and app.config['SECRET_KEY']=='dev-only-change-me': raise RuntimeError('Set SECRET_KEY before starting')
     db.init_app(app);login_manager.init_app(app);login_manager.login_view='login';csrf.init_app(app)
     app.jinja_env.filters['rm']=lambda v:f'{money(v):,.2f}'
-    app.jinja_env.filters['mytime']=lambda d: d.replace(tzinfo=timezone.utc).astimezone(MYT).strftime('%Y-%m-%d %H:%M') if d else ''
+    app.jinja_env.filters['mytime']=format_business_time
 
     @app.cli.command('init-db')
     def init_db():
@@ -704,6 +736,31 @@ def create_app(test_config=None):
         elif pid not in permitted_platform_ids():abort(403)
         session['platform_id']=pid
         return redirect(request.referrer if request.referrer and request.referrer.startswith(request.host_url) else url_for('new_transaction') if permitted('create_transaction') and current_user.role!='admin' else url_for('dashboard'))
+
+    @app.route('/admin/timezone',methods=['GET','POST'])
+    @role_required('admin')
+    def manage_timezone():
+        if request.method=='POST':
+            raw=request.form.get('offset_minutes','')
+            try:
+                minutes=int(raw)
+                if minutes < -720 or minutes > 840 or minutes%30!=0:
+                    raise ValueError('Select a valid GMT offset')
+                previous=timezone_at()
+                if previous.utcoffset(None)==timedelta(minutes=minutes):
+                    flash('Timezone is already selected','info')
+                else:
+                    change=BusinessTimezoneChange(offset_minutes=minutes,actor_id=current_user.id,effective_at=now())
+                    db.session.add(change)
+                    db.session.add(Audit(actor_id=current_user.id,action='CHANGE_TIMEZONE',detail=f'GMT offset changed to {minutes:+d} minutes; effective from {change.effective_at.isoformat()} UTC; older timestamps unchanged'))
+                    db.session.commit()
+                    flash('New GMT offset applied to future activity; existing transaction dates and timestamps are unchanged','success')
+            except (ValueError,TypeError) as e:
+                db.session.rollback();flash(str(e),'danger')
+            return redirect(url_for('manage_timezone'))
+        current=timezone_at()
+        history=BusinessTimezoneChange.query.order_by(BusinessTimezoneChange.effective_at.desc()).limit(30).all()
+        return render_template('timezone_settings.html',offset_minutes=int(current.utcoffset(None).total_seconds()//60),history=history)
 
     @app.route('/admin/platforms',methods=['GET','POST'])
     @role_required('admin')
@@ -817,7 +874,7 @@ def create_app(test_config=None):
         history_by_bank = {}
         for h in history:
             history_by_bank.setdefault(h.bank_id, []).append(h)
-        day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=MYT).astimezone(timezone.utc)
+        day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=timezone_for_report_day(day)).astimezone(timezone.utc)
         existing = [b for b in all_banks if b.created_at is None or b.created_at.astimezone(timezone.utc) < day_end]
         statuses = {b.id: bank_status_on(b, day, history_by_bank) for b in existing}
         bal = balances_through(day)
@@ -980,7 +1037,7 @@ def create_app(test_config=None):
         if status_filter in BANK_STATUSES:
             bank_query=bank_query.filter(Bank.status==status_filter)
         bank_pagination=bank_query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
-        end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
+        end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=timezone_for_report_day(day)).astimezone(timezone.utc)
         history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
         return render_template('banks.html',banks=bank_pagination.items,bank_stats=bank_daily_overview(bank_pagination.items,day) if permitted('view_bank_balances') else {},balances={b.id:ledger_balance(b.id,day)+unclaimed_balance_components([b.id],day).get(b.id,Decimal('0.00')) for b in bank_pagination.items} if permitted('view_bank_balances') else {},
                                statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day,
@@ -1206,7 +1263,7 @@ def create_app(test_config=None):
         return render_template('bank_investigation.html',bank=bank,movements=movements,
             summary=summary,pending=pending,count=count,page=page,pages=pages,
             direction=direction,search=search,raw_start=raw_start,raw_end=raw_end,
-            calculated_balance=ledger_balance(bank.id)+unclaimed_balance_components([bank.id]).get(bank.id,Decimal('0.00')),myt=MYT)
+            calculated_balance=ledger_balance(bank.id)+unclaimed_balance_components([bank.id]).get(bank.id,Decimal('0.00')),myt=timezone_at())
 
     @app.get('/workspace')
     @login_required

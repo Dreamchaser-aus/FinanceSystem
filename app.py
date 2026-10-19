@@ -778,18 +778,25 @@ def create_app(test_config=None):
                 flash('Transaction confirmed and balance updated','success');return redirect(url_for('new_transaction'))
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
         
-        balance_banks=[];balance_values={};recent=[]
+        balance_banks=[];balance_values={};recent=[];recent_pagination=None
         if permitted('view_bank_balances'):
             balance_banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
             balance_values={b.id:ledger_balance(b.id) for b in balance_banks}
             bank_ids=[b.id for b in balance_banks]
             if permitted('view_bank_movements') and bank_ids:
-                recent=db.session.execute(select(Entry,Transaction,Bank.name)
+                movement_query=(select(Entry,Transaction,Bank.name)
                     .join(Transaction,Transaction.id==Entry.transaction_id)
                     .join(Bank,Bank.id==Entry.bank_id)
                     .where(Entry.bank_id.in_(bank_ids),Transaction.status=='confirmed',platform_scope(Transaction))
-                    .order_by(Transaction.created_at.desc()).limit(20)).all()
-        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,recent=recent)
+                    .order_by(Transaction.created_at.desc(),Entry.id.desc()))
+                movement_count=db.session.scalar(select(func.count()).select_from(movement_query.order_by(None).subquery())) or 0
+                page=max(1,request.args.get('recent_page',1,type=int))
+                per_page=10
+                total_pages=max(1,(movement_count+per_page-1)//per_page)
+                page=min(page,total_pages)
+                recent=db.session.execute(movement_query.offset((page-1)*per_page).limit(per_page)).all()
+                recent_pagination={'page':page,'pages':total_pages,'total':movement_count,'has_prev':page>1,'has_next':page<total_pages}
+        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,recent=recent,recent_pagination=recent_pagination)
 
     @app.get('/workspace')
     @login_required

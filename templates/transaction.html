@@ -4,7 +4,7 @@
   <div><h3 class="mb-1">New Transaction</h3><div class="text-muted">One form for customer, bank and dealer transactions</div></div>
   <div class="d-flex gap-2">{% if can("view_bank_balances") %}<a class="btn btn-primary" href="{{url_for('workspace')}}">All Bank Balances</a>{% endif %}{% if can("view_transactions") %}<a class="btn btn-outline-secondary" href="{{url_for('transactions')}}">History</a>{% endif %}</div>
 </div>
-<div class="card p-3 p-lg-4" style="max-width:820px">
+<div class="row g-3 align-items-start"><div class="col-12 {{'col-xl-7' if can('view_bank_balances') else 'col-xl-9'}}"><div class="card p-3 p-lg-4">
   <form method="post" id="newTransactionForm">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="row g-3">
@@ -31,7 +31,9 @@
     <button class="btn btn-primary" type="submit" id="submitBtn">Confirm Transaction</button>
     <p class="text-muted small mt-2 mb-0">Submit only after payment is confirmed. Dealer-paid customer withdrawals do not change bank balances.</p>
   </form>
-</div>
+</div></div>
+{% if can('view_bank_balances') %}<div class="col-12 col-xl-5"><div class="card p-3 mb-3"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">All Bank Balances</h5><a class="btn btn-sm btn-outline-primary" href="{{url_for('new_transaction')}}">↻ Refresh</a></div><p class="small text-muted mb-2">System balances after confirmed transactions · AUD</p><div style="max-height:340px;overflow:auto">{% for b in balance_banks %}<div class="d-flex justify-content-between align-items-center border-bottom py-2 gap-2"><span><strong>{{b.name}}</strong><br><small>{{b.kind|title}}</small></span><strong class="money">{{balance_values[b.id]|rm}}</strong></div>{% else %}<p class="text-muted">No bank accounts in this platform.</p>{% endfor %}</div></div>
+{% if can('view_bank_movements') %}<div class="card p-3"><h5>Latest Transactions</h5><div class="table-responsive" style="max-height:370px"><table class="table table-sm"><thead><tr><th>Time</th><th>Bank</th><th>Reference</th><th class="text-end">AUD</th></tr></thead><tbody>{% for e,t,name in recent %}<tr><td class="small">{{t.created_at|mytime}}</td><td>{{name}}</td><td>{{t.reference}}</td><td class="text-end money {{'text-success' if e.delta>=0 else 'text-danger'}}">{{'+' if e.delta>=0 else ''}}{{e.delta|rm}}</td></tr>{% else %}<tr><td colspan="4">No recent movements</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}</div>{% endif %}</div>
 <script>
 (function () {
   const get = id => document.getElementById(id);

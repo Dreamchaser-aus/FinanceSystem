@@ -929,7 +929,7 @@ def create_app(test_config=None):
                 movement_query=(select(Entry,Transaction,Bank.name)
                     .join(Transaction,Transaction.id==Entry.transaction_id)
                     .join(Bank,Bank.id==Entry.bank_id)
-                    .where(Entry.bank_id.in_(bank_ids),Transaction.status=='confirmed',platform_scope(Transaction))
+                    .where(Entry.bank_id.in_(bank_ids),Transaction.status.in_(['confirmed','voided']),platform_scope(Transaction))
                     .order_by(Transaction.created_at.desc(),Entry.id.desc()))
                 if movement_bank in bank_ids:
                     movement_query=movement_query.where(Entry.bank_id==movement_bank)
@@ -1010,7 +1010,7 @@ def create_app(test_config=None):
             recent=db.session.execute(select(Entry,Transaction,Bank.name)
                 .join(Transaction,Transaction.id==Entry.transaction_id)
                 .join(Bank,Bank.id==Entry.bank_id)
-                .where(Entry.bank_id.in_(bank_ids),Transaction.status=='confirmed',platform_scope(Transaction))
+                .where(Entry.bank_id.in_(bank_ids),Transaction.status.in_(['confirmed','voided']),platform_scope(Transaction))
                 .order_by(Transaction.created_at.desc()).limit(40)).all()
         pending={}
         if permitted('manage_unclaimed') and bank_ids:
@@ -1187,9 +1187,15 @@ def create_app(test_config=None):
         else:
             chosen=selected_platform_id()
             if chosen and chosen!=item.platform_id:abort(403)
-        return render_template('transaction_audit_detail.html',item=item,
-            before=json.loads(item.before_json) if item.before_json else None,
-            after=json.loads(item.after_json) if item.after_json else None)
+        before=json.loads(item.before_json) if item.before_json else None
+        after=json.loads(item.after_json) if item.after_json else None
+        snapshots=[v for v in (before,after) if isinstance(v,dict)]
+        bank_ids={e.get('bank_id') for v in snapshots for e in v.get('entries',[]) if e.get('bank_id')}
+        user_ids={v.get('created_by') for v in snapshots if v.get('created_by')}
+        bank_names={b.id:b.name for b in Bank.query.filter(Bank.id.in_(bank_ids),Bank.platform_id==item.platform_id).all()} if bank_ids else {}
+        user_names={u.id:u.username for u in User.query.filter(User.id.in_(user_ids)).all()} if user_ids else {}
+        return render_template('transaction_audit_detail.html',item=item,before=before,after=after,
+            bank_names=bank_names,user_names=user_names)
 
     @app.route('/transactions/<transaction_id>/edit', methods=['GET','POST'])
     @role_required('admin','staff')

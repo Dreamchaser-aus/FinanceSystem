@@ -1,5 +1,35 @@
 {% extends 'base.html' %}{% block content %}
-<a class="btn btn-outline-secondary btn-sm mb-3" href="{{url_for('transaction_audit_list')}}">← Audit Trail</a>
-<h3>Audit Event: {{item.action}}</h3><div class="card p-3 p-lg-4 mb-3"><dl class="row mb-0"><dt class="col-sm-3">Transaction reference</dt><dd class="col-sm-9">{{item.transaction.reference}}</dd><dt class="col-sm-3">Actor</dt><dd class="col-sm-9">{{item.actor.username}}</dd><dt class="col-sm-3">Time (MYT)</dt><dd class="col-sm-9">{{item.created_at|mytime}}</dd><dt class="col-sm-3">Platform ID</dt><dd class="col-sm-9">{{item.platform_id}}</dd><dt class="col-sm-3">Reason</dt><dd class="col-sm-9">{{item.reason or '—'}}</dd></dl></div>
-<div class="row g-3"><div class="col-lg-6"><div class="card p-3 h-100"><h5>Before</h5>{% if before %}<pre class="small mb-0" style="white-space:pre-wrap;overflow-wrap:anywhere">{{before|tojson(indent=2)}}</pre>{% else %}<p class="text-muted">No previous record (creation)</p>{% endif %}</div></div><div class="col-lg-6"><div class="card p-3 h-100"><h5>After</h5>{% if after %}<pre class="small mb-0" style="white-space:pre-wrap;overflow-wrap:anywhere">{{after|tojson(indent=2)}}</pre>{% else %}<p class="text-muted">No snapshot</p>{% endif %}</div></div></div>
+<a class="btn btn-outline-secondary btn-sm mb-3" href="{{url_for('transaction_audit_list')}}">← Back to Audit Trail</a>
+{% set action_label={'CREATE':'Create Transaction','EDIT':'Edit Transaction','VOID':'Delete Transaction'} %}
+<h3 class="mb-3">{{action_label.get(item.action,item.action)}}</h3>
+<div class="card p-3 p-lg-4 mb-3"><div class="row g-3">
+<div class="col-md-6"><div class="text-muted small">Transaction Reference</div><strong>{{(after or before or {}).get('reference',item.transaction.reference)}}</strong></div>
+<div class="col-md-6"><div class="text-muted small">Performed By</div><strong>{{item.actor.username}}</strong></div>
+<div class="col-md-6"><div class="text-muted small">Date &amp; Time (Malaysia)</div><strong>{{item.created_at|mytime}}</strong></div>
+<div class="col-md-6"><div class="text-muted small">Action</div><span class="badge {{'bg-danger' if item.action=='VOID' else 'bg-primary' if item.action=='EDIT' else 'bg-success'}}">{{action_label.get(item.action,item.action)}}</span></div>
+{% if item.reason %}<div class="col-12"><div class="text-muted small">Reason for Deletion</div><strong>{{item.reason}}</strong></div>{% endif %}
+</div></div>
+{% macro snapshot(data, heading) %}
+<div class="card p-3 h-100"><h5>{{heading}}</h5>
+{% if data %}
+{% set kinds={'deposit':'Customer Deposit','withdrawal':'Customer Withdrawal','transfer':'Bank Transfer','dealer_payout':'Dealer Payout','dealer_buy':'Dealer Buy','dealer_sell':'Dealer Sell'} %}
+<div class="table-responsive"><table class="table table-sm mb-0"><tbody>
+<tr><th style="width:38%">Transaction Type</th><td>{{kinds.get(data.get('kind'),data.get('kind','—'))}}</td></tr>
+<tr><th>Reference</th><td>{{data.get('reference') or '—'}}</td></tr>
+<tr><th>Customer ID</th><td>{{data.get('customer_ref') or '—'}}</td></tr>
+<tr><th>Amount (AUD)</th><td class="fw-semibold">{{data.get('signed_amount','0')|float|abs|rm}}</td></tr>
+<tr><th>Business Date</th><td>{{data.get('business_date') or '—'}}</td></tr>
+<tr><th>Status</th><td>{% if data.get('status')=='voided' %}<span class="badge bg-danger">DELETED</span>{% else %}<span class="badge bg-success">{{data.get('status','—')|upper}}</span>{% endif %}</td></tr>
+<tr><th>Created By</th><td>{{user_names.get(data.get('created_by'),'Unknown user')}}</td></tr>
+<tr><th>Remark</th><td style="overflow-wrap:anywhere">{{data.get('remark') or '—'}}</td></tr>
+{% for entry in data.get('entries',[]) %}<tr><th>{{'Bank / Movement' if loop.first else 'Additional Bank / Movement'}}</th><td>{{bank_names.get(entry.get('bank_id'),'Unknown bank')}} · {{'+' if entry.get('delta','0')|float>=0 else '−'}}AUD {{entry.get('delta','0')|float|abs|rm}}</td></tr>{% endfor %}
+</tbody></table></div>
+{% else %}<p class="text-muted mb-0">No previous record — this transaction was newly created.</p>{% endif %}
+</div>
+{% endmacro %}
+{% if item.action=='CREATE' %}{{snapshot(after,'Transaction Created')}}
+{% elif item.action=='VOID' %}{{snapshot(before,'Original Transaction (Before Deletion)')}}
+<div class="alert alert-danger mt-3 mb-0"><strong>Deleted / Voided.</strong> This transaction remains in history but is excluded from bank balances.</div>
+{% else %}<div class="row g-3"><div class="col-lg-6">{{snapshot(before,'Before Edit')}}</div><div class="col-lg-6">{{snapshot(after,'After Edit')}}</div></div>{% endif %}
+<details class="card p-3 mt-3"><summary class="fw-semibold" style="cursor:pointer">Technical data (optional)</summary><div class="row g-3 mt-2"><div class="col-lg-6"><h6>Before (JSON)</h6><pre class="small" style="white-space:pre-wrap;overflow-wrap:anywhere">{{before|tojson(indent=2) if before else '—'}}</pre></div><div class="col-lg-6"><h6>After (JSON)</h6><pre class="small" style="white-space:pre-wrap;overflow-wrap:anywhere">{{after|tojson(indent=2) if after else '—'}}</pre></div></div></details>
 {% endblock %}

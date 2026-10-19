@@ -827,7 +827,6 @@ def create_app(test_config=None):
             require_permission('create_bank')
             try:
                 name=request.form.get('name','').strip()
-                chosen_day=validate_entry_business_day(request.form.get('business_date'))
                 kind=request.form.get('kind','')
                 if not name or kind not in ('deposit','withdrawal','store','other'): raise ValueError('Invalid bank details')
                 pid=require_single_platform()
@@ -925,6 +924,7 @@ def create_app(test_config=None):
         if request.method=='POST':
             pid=require_single_platform()
             try:
+                chosen_day=validate_entry_business_day(request.form.get('business_date'))
                 kind=request.form.get('kind','')
                 if kind in ('dealer_sell','dealer_buy','dealer_payout'):
                     record_dealer(kind,request.form.get('reference',''),request.form.get('amount',''),

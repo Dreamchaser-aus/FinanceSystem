@@ -1,5 +1,6 @@
 {% extends 'base.html' %}
 {% block content %}
+<style>.bf-transaction-table thead th,.bf-transaction-table tbody td{text-align:center!important;vertical-align:middle}.bf-transaction-table tbody tr{transition:background .15s}.bf-transaction-table td{padding:11px 10px}.bf-transaction-table .font-monospace{font-size:.78rem}.bf-transaction-table .btn{min-width:68px}</style>
 <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
   <div><h3 class="mb-1">Transaction Management</h3><div class="text-muted">Search, filter and review transactions</div></div>
   <a class="btn btn-primary" href="{{ url_for('new_transaction') }}">+ New Transaction</a>
@@ -20,18 +21,18 @@
     </div>
   </form>
   <div class="table-responsive">
-    <table class="table table-hover align-middle">
-      <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th class="text-end">Amount</th><th>Actions</th></tr></thead>
+    <table class="table table-hover align-middle bf-transaction-table text-center">
+      <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th>Amount</th><th>Actions</th></tr></thead>
       <tbody>
       {% for t in records.items %}
         <tr class="{{'table-danger' if t.status=='voided' else ''}}">
-          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} MYT</div>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span>{% endif %}</td>
+          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} Business GMT</div>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span>{% endif %}</td>
           <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
             {% if t.kind == 'deposit' %}<span class="badge bg-success">Deposit</span>
             {% elif t.kind == 'withdrawal' %}<span class="badge bg-danger">Withdrawal</span>
             {% else %}<span class="badge bg-primary">Transfer</span>{% endif %}
           </td>
-          <td class="text-end money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '')) }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}AUD {{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and current_user.role in ('admin','staff') %}<div class="d-flex gap-1 flex-wrap"><a class="btn btn-sm btn-outline-primary" href="{{url_for('edit_transaction',transaction_id=t.id)}}">Edit</a><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
+          <td class="money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '')) }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}{{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and can('edit_transaction') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<div class="d-flex justify-content-center gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
         </tr>
       {% else %}
         <tr><td colspan="4" class="text-center text-muted py-4">No matching transactions</td></tr>

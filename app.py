@@ -906,6 +906,59 @@ def create_app(test_config=None):
                 recent_pagination={'page':page,'pages':total_pages,'total':movement_count,'has_prev':page>1,'has_next':page<total_pages}
         return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36])
 
+    @app.get('/banks/<bank_id>/investigation')
+    @login_required
+    def bank_investigation(bank_id):
+        # An explicit bank-scoped endpoint; never trust a bank ID without platform authorization.
+        require_permission('view_bank_movements')
+        pid=require_single_platform()
+        bank=bank_for_platform(bank_id,pid)
+        direction=request.args.get('direction','all')
+        if direction not in ('all','in','out'): abort(400,description='Invalid direction')
+        search=request.args.get('q','').strip()[:120]
+        raw_start=request.args.get('from',request.args.get('from_date','')).strip()
+        raw_end=request.args.get('to',request.args.get('to_date','')).strip()
+        try:
+            start=date.fromisoformat(raw_start) if raw_start else None
+            end=date.fromisoformat(raw_end) if raw_end else None
+        except ValueError: abort(400,description='Invalid date')
+        if start and end and start>end: abort(400,description='Invalid date range')
+        query=(select(Entry,Transaction)
+            .join(Transaction,Transaction.id==Entry.transaction_id)
+            .where(Entry.bank_id==bank.id,Transaction.platform_id==pid,
+                   Transaction.status=='confirmed'))
+        if direction=='in':query=query.where(Entry.delta>0)
+        if direction=='out':query=query.where(Entry.delta<0)
+        if start:query=query.where(Transaction.business_date>=start)
+        if end:query=query.where(Transaction.business_date<=end)
+        if search:
+            pattern='%'+search.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+            query=query.where(or_(Transaction.reference.ilike(pattern,escape='\\'),
+                                  Transaction.customer_ref.ilike(pattern,escape='\\'),
+                                  Transaction.remark.ilike(pattern,escape='\\')))
+        sub=query.order_by(None).subquery()
+        summary=db.session.execute(select(
+            func.count(sub.c.id),
+            func.coalesce(func.sum(case((sub.c.delta>0,sub.c.delta),else_=0)),0),
+            func.coalesce(func.sum(case((sub.c.delta<0,-sub.c.delta),else_=0)),0),
+            func.coalesce(func.sum(case((sub.c.delta>0,1),else_=0)),0),
+            func.coalesce(func.sum(case((sub.c.delta<0,1),else_=0)),0)
+        )).one()
+        count=int(summary[0]); per_page=25
+        pages=max(1,(count+per_page-1)//per_page)
+        page=min(max(1,request.args.get('page',1,type=int)),pages)
+        movements=db.session.execute(query.order_by(Transaction.created_at.desc(),Entry.id.desc())
+            .limit(per_page).offset((page-1)*per_page)).all()
+        pending=0
+        if permitted('manage_unclaimed'):
+            pending=db.session.scalar(select(func.count(UnclaimedDeposit.id)).where(
+                UnclaimedDeposit.bank_id==bank.id,UnclaimedDeposit.platform_id==pid,
+                UnclaimedDeposit.status=='unclaimed')) or 0
+        return render_template('bank_investigation.html',bank=bank,movements=movements,
+            summary=summary,pending=pending,count=count,page=page,pages=pages,
+            direction=direction,search=search,raw_start=raw_start,raw_end=raw_end,
+            calculated_balance=ledger_balance(bank.id),myt=MYT)
+
     @app.get('/workspace')
     @login_required
     def workspace():

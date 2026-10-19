@@ -1,0 +1,8 @@
+{% extends 'base.html' %}{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3"><h3>Blocked Settlement — {{bank.name}}</h3><a href="{{url_for('banks')}}" class="btn btn-outline-secondary">Back to Banks</a></div>
+<div class="alert alert-info">Snapshots are immutable audit records. Unclaimed amounts are NOT posted as deposits and are excluded from Total Bank Balance. Pending leads remain frozen while the bank is Blocked.</div>
+{% for record in records %}<div class="card p-3 mb-3"><h5>{{record.created_at|mytime}} · {{record.actor.username}}</h5><p>{{record.remark or 'No remark'}}</p>
+<div class="row g-2 mb-3"><div class="col-md-3">Confirmed Ledger<br><strong>AUD {{record.ledger_balance|rm}}</strong></div><div class="col-md-3">Unclaimed ({{record.unclaimed_count}})<br><strong>AUD {{record.unclaimed_amount|rm}}</strong></div><div class="col-md-3">With Unclaimed<br><strong>AUD {{record.with_unclaimed|rm}}</strong></div></div>
+<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Reference</th><th class="text-end">Amount (AUD)</th><th>Created (UTC)</th></tr></thead><tbody>
+{% for lead in json.loads(record.leads_json) %}<tr><td>{{lead.reference}}</td><td class="text-end">{{lead.amount}}</td><td>{{lead.created_at or '—'}}</td></tr>{% else %}<tr><td colspan="3">No open Unclaimed leads at block time</td></tr>{% endfor %}
+</tbody></table></div></div>{% else %}<p>No blocked settlement records yet.</p>{% endfor %}{% endblock %}

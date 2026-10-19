@@ -375,6 +375,25 @@ def balances_through(day):
             for b in Bank.query.all()}
 
 
+def unclaimed_balance_components(bank_ids, day=None):
+    """Pending unclaimed leads are bank-reported credits, not posted ledger entries.
+
+    Only current open leads are included. Historical snapshots cannot reconstruct
+    subsequently claimed/dismissed leads without a status history table.
+    """
+    if not bank_ids: return {}
+    q=UnclaimedDeposit.query.filter(UnclaimedDeposit.bank_id.in_(bank_ids),
+                                    UnclaimedDeposit.status=='unclaimed')
+    leads=q.all()
+    result={bid:Decimal('0.00') for bid in bank_ids}
+    for lead in leads:
+        created=lead.created_at
+        if day is not None and created is not None:
+            if created.tzinfo is None: created=created.replace(tzinfo=timezone.utc)
+            if created.astimezone(MYT).date()>day: continue
+        result[lead.bank_id]+=money(lead.amount)
+    return result
+
 def bank_daily_overview(bank_list, day=None):
     """Per-bank posted movements for the MYT business day; no manual balance input.
 
@@ -407,13 +426,15 @@ def bank_daily_overview(bank_list, day=None):
         .join(Transaction,Entry.transaction_id==Transaction.id)
         .where(Entry.bank_id.in_(ids),Transaction.status=='confirmed')
         .group_by(Entry.bank_id)).all())
+    pending=unclaimed_balance_components(ids,day)
     out={}
     for b in bank_list:
         r=daily.get(b.id)
         opening=money(b.opening_balance)+money(before.get(b.id,0))
         change=money(r.delta) if r else Decimal('0.00')
         out[b.id]={'opening':opening,'daily':change,'day_close':opening+change,
-                   'current':money(b.opening_balance)+money(total.get(b.id,0)),
+                   'current':money(b.opening_balance)+money(total.get(b.id,0))+pending.get(b.id,Decimal('0.00')),
+                   'unclaimed':pending.get(b.id,Decimal('0.00')),
                    'in_count':int(r.in_count) if r else 0,'out_count':int(r.out_count) if r else 0,
                    'in_amount':money(r.in_amount) if r else Decimal('0.00'),
                    'out_amount':money(r.out_amount) if r else Decimal('0.00')}
@@ -698,11 +719,14 @@ def create_app(test_config=None):
         existing = [b for b in all_banks if b.created_at is None or b.created_at.astimezone(timezone.utc) < day_end]
         statuses = {b.id: bank_status_on(b, day, history_by_bank) for b in existing}
         bal = balances_through(day)
+        unclaimed_components = unclaimed_balance_components([b.id for b in existing], day)
+        display_bal = {b.id: bal[b.id] + unclaimed_components.get(b.id, Decimal('0.00')) for b in existing}
+        dashboard_bank_stats = bank_daily_overview(active_banks, day)
         # "Bank Block" means status=closed; other issues remain in the closing total.
         blocked = [b for b in existing if statuses[b.id] == 'closed']
         active_banks = [b for b in existing if statuses[b.id] == 'active']
-        closing_total = sum((bal[b.id] for b in existing if statuses[b.id] != 'closed'), Decimal('0'))
-        active_total = sum((bal[b.id] for b in active_banks), Decimal('0'))
+        closing_total = sum((display_bal[b.id] for b in existing if statuses[b.id] != 'closed'), Decimal('0'))
+        active_total = sum((display_bal[b.id] for b in active_banks), Decimal('0'))
         start = (bank_page - 1) * 10
         bank_items = active_banks[start:start + 10]
         bank_pages = max(1, (len(active_banks) + 9) // 10)
@@ -781,9 +805,9 @@ def create_app(test_config=None):
             'dashboard.html', selected_day=day, start_day=start_day,
             dealer_items=dealer_items, dealer_totals=dealer_totals,
             active_customers=len(active_ids), new_customers=new_count,
-            banks=bank_items, balances=bal,
+            banks=bank_items, balances=display_bal, dashboard_bank_stats=dashboard_bank_stats, dashboard_unclaimed=unclaimed_components,
             totals=totals, latest=latest, transaction_banks=transaction_banks, platform_names=platform_names, deleted_by=deleted_by,
-            grand=active_total, page_total=sum((bal[b.id] for b in bank_items), Decimal('0')),
+            grand=active_total, page_total=sum((display_bal[b.id] for b in bank_items), Decimal('0')),
             bank_page=bank_page, bank_pages=bank_pages, active_count=len(active_banks),
             block_count=len(blocked), block_banks=blocked, closing_total=closing_total,
             closed_banks=closed_page.items, closed_page=closed_page,
@@ -851,7 +875,7 @@ def create_app(test_config=None):
         bank_pagination=bank_query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
         end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
         history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
-        return render_template('banks.html',banks=bank_pagination.items,bank_stats=bank_daily_overview(bank_pagination.items,day) if permitted('view_bank_balances') else {},balances=balances_through(day) if permitted('view_bank_balances') else {},
+        return render_template('banks.html',banks=bank_pagination.items,bank_stats=bank_daily_overview(bank_pagination.items,day) if permitted('view_bank_balances') else {},balances={b.id:ledger_balance(b.id,day)+unclaimed_balance_components([b.id],day).get(b.id,Decimal('0.00')) for b in bank_pagination.items} if permitted('view_bank_balances') else {},
                                statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day,
                                labels=BankLabel.query.filter(platform_scope(BankLabel)).order_by(BankLabel.name).all(),
                                assigned_labels={a.bank_id:a.label_id for a in db.session.execute(select(BankLabelAssignment).join(Bank,Bank.id==BankLabelAssignment.bank_id).where(platform_scope(Bank))).scalars().all()},
@@ -1017,7 +1041,7 @@ def create_app(test_config=None):
         return render_template('bank_investigation.html',bank=bank,movements=movements,
             summary=summary,pending=pending,count=count,page=page,pages=pages,
             direction=direction,search=search,raw_start=raw_start,raw_end=raw_end,
-            calculated_balance=ledger_balance(bank.id),myt=MYT)
+            calculated_balance=ledger_balance(bank.id)+unclaimed_balance_components([bank.id]).get(bank.id,Decimal('0.00')),myt=MYT)
 
     @app.get('/workspace')
     @login_required
@@ -1025,7 +1049,8 @@ def create_app(test_config=None):
         require_permission('view_bank_balances')
         banks_list=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
         bank_ids=[b.id for b in banks_list]
-        current_balances={b.id:ledger_balance(b.id) for b in banks_list}
+        pending_balances=unclaimed_balance_components([b.id for b in banks_list])
+        current_balances={b.id:ledger_balance(b.id)+pending_balances.get(b.id,Decimal('0.00')) for b in banks_list}
         recent=[]
         if permitted('view_bank_movements') and bank_ids:
             recent=db.session.execute(select(Entry,Transaction,Bank.name)

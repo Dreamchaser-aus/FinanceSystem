@@ -1,0 +1,12 @@
+{% extends 'base.html' %}{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3"><div><h3>Transaction Audit Trail</h3><p class="text-muted mb-0">Create / Edit / Void history · MYT · read only</p></div></div>
+<div class="card p-3 p-lg-4"><form method="get" class="row g-2 mb-3">
+<div class="col-md-4"><input class="form-control" name="reference" value="{{reference}}" placeholder="Transaction reference"></div>
+<div class="col-md-3"><input class="form-control" name="actor" value="{{actor}}" placeholder="Staff username"></div>
+<div class="col-md-3"><select class="form-select" name="action"><option value="">All actions</option>{% for a in ['CREATE','EDIT','VOID'] %}<option value="{{a}}" {{'selected' if action==a else ''}}>{{a}}</option>{% endfor %}</select></div>
+<div class="col-md-2"><button class="btn btn-primary w-100">Search</button></div></form>
+<div class="table-responsive"><table class="table table-hover"><thead><tr><th>Time (MYT)</th><th>Action</th><th>Reference</th><th>Performed by</th><th>Platform</th><th></th></tr></thead><tbody>
+{% for log in logs.items %}<tr><td class="text-nowrap">{{log.created_at|mytime}}</td><td><span class="badge {{'bg-danger' if log.action=='VOID' else 'bg-primary' if log.action=='EDIT' else 'bg-success'}}">{{log.action}}</span></td><td class="font-monospace">{{log.transaction.reference}}</td><td>{{log.actor.username}}</td><td class="small font-monospace">{{log.platform_id}}</td><td><a class="btn btn-sm btn-outline-primary" href="{{url_for('transaction_audit_detail',audit_id=log.id)}}">Details</a></td></tr>
+{% else %}<tr><td colspan="6" class="text-center text-muted">No audit events found</td></tr>{% endfor %}
+</tbody></table></div><div class="d-flex justify-content-between"><span>Page {{logs.page}} / {{logs.pages or 1}} · {{logs.total}} events</span><div class="d-flex gap-2">{% if logs.has_prev %}<a class="btn btn-outline-secondary btn-sm" href="{{url_for('transaction_audit_list',page=logs.prev_num,reference=reference,actor=actor,action=action)}}">Previous</a>{% endif %}{% if logs.has_next %}<a class="btn btn-outline-secondary btn-sm" href="{{url_for('transaction_audit_list',page=logs.next_num,reference=reference,actor=actor,action=action)}}">Next</a>{% endif %}</div></div></div>
+{% endblock %}

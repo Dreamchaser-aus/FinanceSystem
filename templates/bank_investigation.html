@@ -1,0 +1,33 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+  <div><h3 class="mb-1">{{bank.name}} · Bank Investigation</h3><div class="text-muted small">{{bank.kind|title}} · Confirmed ledger movements · AUD</div></div>
+  <a href="{{url_for('banks')}}" class="btn btn-outline-secondary btn-sm">← Banks</a>
+</div>
+<div class="row g-3 mb-3">
+  <div class="col-6 col-lg-3"><div class="card p-3"><small>System balance (all dates)</small><h5 class="money mb-0">{{calculated_balance|rm}}</h5></div></div>
+  <div class="col-6 col-lg-3"><div class="card p-3"><small>Filtered IN · {{summary[3]}} entries</small><h5 class="money text-success mb-0">+{{summary[1]|rm}}</h5></div></div>
+  <div class="col-6 col-lg-3"><div class="card p-3"><small>Filtered OUT · {{summary[4]}} entries</small><h5 class="money text-danger mb-0">−{{summary[2]|rm}}</h5></div></div>
+  <div class="col-6 col-lg-3"><div class="card p-3"><small>Unclaimed leads</small><h5 class="mb-0">{% if can('manage_unclaimed') %}{{pending}}{% else %}Restricted{% endif %}</h5></div></div>
+</div>
+<div class="card p-3 mb-3">
+ <form method="get" class="row g-2 align-items-end">
+  <div class="col-12 col-lg-4"><label class="form-label">Reference / Customer / Remark</label><input class="form-control" name="q" maxlength="120" value="{{search}}" placeholder="Search bank movements"></div>
+  <div class="col-6 col-lg-2"><label class="form-label">Direction</label><select class="form-select" name="direction"><option value="all" {{'selected' if direction=='all'}}>All</option><option value="in" {{'selected' if direction=='in'}}>IN</option><option value="out" {{'selected' if direction=='out'}}>OUT</option></select></div>
+  <div class="col-6 col-lg-2"><label class="form-label">From</label><input class="form-control" type="date" name="from" value="{{raw_start}}"></div>
+  <div class="col-6 col-lg-2"><label class="form-label">To</label><input class="form-control" type="date" name="to" value="{{raw_end}}"></div>
+  <div class="col-6 col-lg-2 d-flex gap-1"><button class="btn btn-primary flex-fill" type="submit">Filter</button><a class="btn btn-outline-secondary" href="{{url_for('bank_investigation',bank_id=bank.id)}}">Clear</a></div>
+ </form>
+</div>
+<div class="card p-3">
+ <div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Confirmed movements</h5><span class="text-muted small">{{count}} entries · Page {{page}} / {{pages}}</span></div>
+ <div class="table-responsive"><table class="table table-hover"><thead><tr><th>Business date</th><th>Created (MYT)</th><th>Reference</th><th>Customer</th><th>Type</th><th>Direction</th><th class="text-end">Amount (AUD)</th><th>Remark</th></tr></thead><tbody>
+ {% for entry,tx in movements %}<tr><td class="text-nowrap">{{tx.business_date}}</td><td class="text-nowrap">{{tx.created_at.astimezone(myt).strftime('%d/%m/%Y %H:%M') if myt is defined else tx.created_at.strftime('%d/%m/%Y %H:%M')}}</td><td class="fw-semibold">{{tx.reference}}</td><td>{{tx.customer_ref or '—'}}</td><td>{{tx.kind|replace('_',' ')|title}}</td><td><span class="badge {{'bg-success' if entry.delta>0 else 'bg-danger'}}">{{'IN' if entry.delta>0 else 'OUT'}}</span></td><td class="money text-end {{'text-success' if entry.delta>0 else 'text-danger'}}">{{'+' if entry.delta>0 else '−'}}{{(entry.delta|abs)|rm}}</td><td>{{tx.remark or '—'}}</td></tr>
+ {% else %}<tr><td colspan="8" class="text-muted text-center py-4">No confirmed movements match these filters.</td></tr>{% endfor %}
+ </tbody></table></div>
+ <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mt-2"><small class="text-muted">Read-only ledger. Investigations do not change balances.</small><div class="btn-group btn-group-sm">
+ {% if page>1 %}<a class="btn btn-outline-primary" href="{{url_for('bank_investigation',bank_id=bank.id,page=page-1,q=search,direction=direction,from_date=raw_start,to_date=raw_end)}}">Previous</a>{% endif %}
+ {% if page<pages %}<a class="btn btn-outline-primary" href="{{url_for('bank_investigation',bank_id=bank.id,page=page+1,q=search,direction=direction,from_date=raw_start,to_date=raw_end)}}">Next</a>{% endif %}
+ </div></div>
+</div>
+{% endblock %}

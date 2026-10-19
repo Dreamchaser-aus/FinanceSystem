@@ -67,10 +67,19 @@ PERMISSIONS={
     'update_bank_status':'Update bank status',
     'view_dealers':'View dealer ledger',
     'close_bank':'Daily closing',
+    'view_bank_balances':'View all bank balances in assigned platform',
+    'view_bank_movements':'View recent bank movements',
+    'create_bank':'Create bank with zero opening balance',
+    'view_dashboard_customers':'Dashboard customer statistics',
+    'view_dashboard_financials':'Dashboard financial summary',
+    'view_dashboard_closing':'Dashboard closing details',
+    'view_dashboard_dealers':'Dashboard dealer summary',
+    'view_dashboard_transactions':'Dashboard recent transactions',
+    'manage_unclaimed':'Log and review unclaimed deposit leads',
 }
 DEFAULT_ROLE_PERMS={
-    'staff':{'view_dashboard','view_banks','create_transaction','view_transactions','view_dealers'},
-    'finance':{'view_dashboard','view_banks','view_transactions','view_dealers','close_bank'},
+    'staff':{'view_dashboard','view_bank_balances','view_bank_movements','create_transaction','view_transactions'},
+    'finance':{'view_dashboard','view_banks','view_bank_balances','view_bank_movements','view_transactions','view_dealers','close_bank'},
     'manager':set(PERMISSIONS),
 }
 
@@ -192,6 +201,21 @@ class DealerTrade(db.Model):
     flow=db.Column(db.String(30),nullable=False)
     dealer=db.relationship('Dealer')
     transaction=db.relationship('Transaction')
+
+class UnclaimedDeposit(db.Model):
+    __tablename__='unclaimed_deposit'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    platform_id=db.Column(db.String(36),db.ForeignKey('platform.id'),nullable=False,index=True)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
+    amount=db.Column(db.Numeric(18,2),nullable=False)
+    reference=db.Column(db.String(120),nullable=False)
+    remark=db.Column(db.Text)
+    status=db.Column(db.String(20),nullable=False,default='unclaimed')
+    transaction_id=db.Column(db.String(36),db.ForeignKey('transaction.id'))
+    created_by=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+    bank=db.relationship('Bank')
+    __table_args__=(UniqueConstraint('bank_id','reference',name='uq_unclaimed_bank_reference'),)
 
 class Closing(db.Model):
     id=db.Column(db.String(36),primary_key=True,default=idgen)
@@ -429,11 +453,13 @@ def create_app(test_config=None):
         if not current_user.is_authenticated:return
         endpoint=request.endpoint or ''
         permission_routes={
-            'dashboard':'view_dashboard','banks':'view_banks',
+            'dashboard':'view_dashboard',
             'new_transaction':'create_transaction','transactions':'view_transactions',
             'edit_transaction':'edit_transaction','delete_transaction':'edit_transaction',
             'update_bank_status':'update_bank_status','dealers':'view_dealers',
             'closing':'close_bank',
+            'workspace':'view_bank_balances',
+            'unclaimed_deposits':'manage_unclaimed',
         }
         if endpoint in permission_routes:require_permission(permission_routes[endpoint])
 
@@ -516,7 +542,7 @@ def create_app(test_config=None):
                 login_user(u)
                 ids=permitted_platform_ids()
                 session['platform_id']='all' if u.role=='admin' else (sorted(ids)[0] if ids else '')
-                return redirect(url_for('dashboard'))
+                return redirect(url_for('dashboard') if u.role=='admin' else url_for('workspace') if permitted('view_bank_balances') else url_for('new_transaction') if permitted('create_transaction') else url_for('transactions') if permitted('view_transactions') else url_for('dashboard'))
             flash('Invalid credentials','danger')
         return render_template('login.html')
 
@@ -527,6 +553,8 @@ def create_app(test_config=None):
     @app.get('/')
     @login_required
     def dashboard():
+        if not any(permitted(p) for p in ('view_dashboard_customers','view_dashboard_financials','view_dashboard_closing','view_dashboard_dealers','view_dashboard_transactions','view_bank_balances')) and current_user.role!='admin':
+            return render_template('dashboard_limited.html')
         start_day, day = selected_range()
         bank_page = max(1, request.args.get('bank_page', 1, type=int))
         close_page = max(1, request.args.get('close_page', 1, type=int))
@@ -626,14 +654,15 @@ def create_app(test_config=None):
     @app.route('/banks',methods=['GET','POST'])
     @login_required
     def banks():
+        if not (permitted('view_banks') or permitted('create_bank')):abort(403)
         if request.method=='POST':
-            if current_user.role!='admin': abort(403)
+            require_permission('create_bank')
             try:
                 name=request.form.get('name','').strip()
                 kind=request.form.get('kind','')
                 if not name or kind not in ('deposit','withdrawal','store','other'): raise ValueError('Invalid bank details')
                 pid=require_single_platform()
-                b=Bank(platform_id=pid,name=name,kind=kind,opening_balance=money(request.form.get('opening_balance','0')))
+                b=Bank(platform_id=pid,name=name,kind=kind,opening_balance=money(request.form.get('opening_balance','0')) if current_user.role=='admin' else Decimal('0'))
                 db.session.add(b);db.session.flush()
                 db.session.add(Audit(actor_id=current_user.id,action='CREATE_BANK',detail=f'{b.id} {name}'))
                 db.session.commit();flash('Bank created','success')
@@ -645,7 +674,7 @@ def create_app(test_config=None):
         bank_pagination=Bank.query.filter(platform_scope(Bank)).order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
         end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
         history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
-        return render_template('banks.html',banks=bank_pagination.items,balances=balances(),
+        return render_template('banks.html',banks=bank_pagination.items,balances=balances() if permitted('view_bank_balances') else {},
                                statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day)
 
     @app.post('/banks/<bank_id>/status')
@@ -693,7 +722,7 @@ def create_app(test_config=None):
     @login_required
     def dealers():
         if request.method=='POST':
-            if current_user.role!='admin': abort(403)
+            require_permission('create_bank')
             pid=require_single_platform()
             name=request.form.get('name','').strip()
             if not name: flash('Dealer name required','danger')
@@ -725,9 +754,78 @@ def create_app(test_config=None):
                                   request.form.get('customer_ref',''),request.form.get('remark',''),platform_id=pid)
                 else:
                     record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None,platform_id=pid)
-                flash('Transaction confirmed and balance updated','success');return redirect(url_for('dashboard'))
+                flash('Transaction confirmed and balance updated','success');return redirect(url_for('workspace') if permitted('view_bank_balances') else url_for('dashboard') if permitted('view_dashboard') else url_for('new_transaction'))
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
         return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all())
+
+    @app.get('/workspace')
+    @login_required
+    def workspace():
+        require_permission('view_bank_balances')
+        banks_list=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
+        bank_ids=[b.id for b in banks_list]
+        current_balances={b.id:ledger_balance(b.id) for b in banks_list}
+        recent=[]
+        if permitted('view_bank_movements') and bank_ids:
+            recent=db.session.execute(select(Entry,Transaction,Bank.name)
+                .join(Transaction,Transaction.id==Entry.transaction_id)
+                .join(Bank,Bank.id==Entry.bank_id)
+                .where(Entry.bank_id.in_(bank_ids),Transaction.status=='confirmed',platform_scope(Transaction))
+                .order_by(Transaction.created_at.desc()).limit(40)).all()
+        pending={}
+        if permitted('manage_unclaimed') and bank_ids:
+            rows=db.session.execute(select(UnclaimedDeposit.bank_id,func.count(UnclaimedDeposit.id))
+                .where(UnclaimedDeposit.bank_id.in_(bank_ids),UnclaimedDeposit.status=='unclaimed',platform_scope(UnclaimedDeposit))
+                .group_by(UnclaimedDeposit.bank_id)).all()
+            pending=dict(rows)
+        return render_template('workspace.html',banks=banks_list,balances=current_balances,
+                               recent=recent,pending=pending)
+
+    @app.route('/unclaimed',methods=['GET','POST'])
+    @login_required
+    def unclaimed_deposits():
+        require_permission('manage_unclaimed')
+        if request.method=='POST':
+            pid=require_single_platform()
+            try:
+                bank_id=request.form.get('bank_id','')
+                bank_for_platform(bank_id,pid)
+                amount=amount_positive(request.form.get('amount',''))
+                reference=request.form.get('reference','').strip()[:120]
+                if not reference:raise ValueError('Bank reference is required')
+                # Leads do NOT post a ledger entry or alter calculated bank balances.
+                obj=UnclaimedDeposit(platform_id=pid,bank_id=bank_id,amount=amount,
+                    reference=reference,remark=request.form.get('remark','').strip()[:2000],created_by=current_user.id)
+                db.session.add(obj);db.session.flush()
+                db.session.add(Audit(actor_id=current_user.id,action='LOG_UNCLAIMED',detail=f'{obj.id} bank={bank_id}'))
+                db.session.commit();flash('Unclaimed deposit lead recorded; bank balance unchanged','success')
+            except (ValueError,IntegrityError) as exc:
+                db.session.rollback();flash(str(exc),'danger')
+            return redirect(url_for('unclaimed_deposits'))
+        banks_list=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
+        rows=UnclaimedDeposit.query.filter(platform_scope(UnclaimedDeposit)).order_by(UnclaimedDeposit.created_at.desc()).limit(100).all()
+        return render_template('unclaimed.html',banks=banks_list,items=rows)
+
+    @app.post('/unclaimed/<lead_id>/claim')
+    @login_required
+    def claim_unclaimed(lead_id):
+        require_permission('manage_unclaimed')
+        lead=db.session.get(UnclaimedDeposit,lead_id)
+        if not lead:abort(404)
+        require_platform(lead.platform_id)
+        transaction_ref=request.form.get('transaction_reference','').strip()
+        if not transaction_ref:abort(400,description='Provide a confirmed deposit transaction reference')
+        tx=Transaction.query.filter_by(reference=transaction_ref,platform_id=lead.platform_id,
+                                      kind='deposit',status='confirmed').first()
+        if not tx:abort(400,description='Confirmed customer deposit not found in this platform')
+        entry=Entry.query.filter_by(transaction_id=tx.id,bank_id=lead.bank_id).first()
+        if not entry or money(entry.delta)!=money(lead.amount):
+            abort(400,description='Bank or amount does not match confirmed deposit')
+        if lead.status!='unclaimed':abort(409)
+        lead.status='claimed';lead.transaction_id=tx.id
+        db.session.add(Audit(actor_id=current_user.id,action='CLAIM_UNCLAIMED',detail=f'{lead.id} transaction={tx.id}'))
+        db.session.commit();flash('Linked to confirmed deposit; no additional bank movement posted','success')
+        return redirect(url_for('unclaimed_deposits'))
 
     @app.get('/transactions')
     @login_required

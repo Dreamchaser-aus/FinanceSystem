@@ -8,6 +8,7 @@
   <form method="post" id="newTransactionForm">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="row g-3">
+      <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="business_date">Transaction Date (MYT)</label><select class="form-select" id="business_date" name="business_date" required><option value="{{entry_today}}">Today — {{entry_today}}</option><option value="{{entry_yesterday}}">Yesterday — {{entry_yesterday}}</option></select><div class="form-text">Only today or yesterday. Actual creation time is always recorded separately.</div></div>
       <div class="col-12"><label class="form-label fw-semibold" for="kind">Transaction Type</label>
         <select class="form-select" id="kind" name="kind" required>
           <option value="deposit">Customer Deposit — Bank Received</option>

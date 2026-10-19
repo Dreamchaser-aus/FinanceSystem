@@ -17,7 +17,11 @@ CREATE TABLE IF NOT EXISTS user_permission (
     permission VARCHAR(60) NOT NULL,
     PRIMARY KEY (user_id, permission)
 );
-INSERT INTO platform (id,name) VALUES ('00000000-0000-4000-8000-000000000001','Legacy Platform')
+-- Existing platform tables created by SQLAlchemy may lack server-side defaults.
+-- Repair defaults for future direct SQL inserts without overwriting existing values.
+ALTER TABLE platform ALTER COLUMN active SET DEFAULT TRUE;
+ALTER TABLE platform ALTER COLUMN created_at SET DEFAULT NOW();
+INSERT INTO platform (id,name,active,created_at) VALUES ('00000000-0000-4000-8000-000000000001','Legacy Platform',TRUE,NOW())
 ON CONFLICT (id) DO NOTHING;
 ALTER TABLE bank ADD COLUMN IF NOT EXISTS platform_id VARCHAR(36);
 ALTER TABLE "transaction" ADD COLUMN IF NOT EXISTS platform_id VARCHAR(36);

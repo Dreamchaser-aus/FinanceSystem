@@ -420,8 +420,10 @@ def bank_daily_overview(bank_list, day=None):
     return out
 
 def check_open_day(day,bank_ids):
-    if day!=business_today(): raise ValueError('V1 only accepts current Malaysia business date')
-    if Closing.query.filter(Closing.business_date==day,Closing.bank_id.in_(bank_ids)).first(): raise ValueError('Bank is closed for today')
+    # Accept only today/yesterday in MYT, including direct internal calls.
+    day=validate_entry_business_day(day.isoformat() if isinstance(day,date) else day)
+    if Closing.query.filter(Closing.business_date==day,Closing.bank_id.in_(bank_ids)).first():
+        raise ValueError('Bank has already been reconciled/closed for the selected business date')
 
 def lock_banks(ids):
     # Postgres row locks serialize balance checks and updates; SQLite is for local demo only.

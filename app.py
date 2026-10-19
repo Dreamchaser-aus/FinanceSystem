@@ -7,7 +7,7 @@ from flask import Flask, render_template, redirect, url_for, flash, request, abo
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import func, select, UniqueConstraint, or_, and_
+from sqlalchemy import func, select, UniqueConstraint, or_, and_, case
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -314,6 +314,50 @@ def balances_through(day):
     return {b.id: money(b.opening_balance) + money(changes.get(b.id, 0))
             for b in Bank.query.all()}
 
+
+def bank_daily_overview(bank_list, day=None):
+    """Per-bank posted movements for the MYT business day; no manual balance input.
+
+    Opening is the calculated ledger balance immediately before day; Current is
+    the all-time ledger balance (including later posted transactions, if any).
+    The displayed daily balance is the as-of-day close and is independent of
+    the current balance when historical dates are selected.
+    """
+    if day is None: day=business_today()
+    ids=[b.id for b in bank_list]
+    if not ids:return {}
+    base=(select(Entry.bank_id,
+                 func.coalesce(func.sum(Entry.delta),0).label('delta'),
+                 func.count(Entry.id).label('entries'),
+                 func.coalesce(func.sum(case((Entry.delta>0,1),else_=0)),0).label('in_count'),
+                 func.coalesce(func.sum(case((Entry.delta<0,1),else_=0)),0).label('out_count'),
+                 func.coalesce(func.sum(case((Entry.delta>0,Entry.delta),else_=0)),0).label('in_amount'),
+                 func.coalesce(func.sum(case((Entry.delta<0,-Entry.delta),else_=0)),0).label('out_amount'))
+          .join(Transaction,Entry.transaction_id==Transaction.id)
+          .where(Entry.bank_id.in_(ids),Transaction.status=='confirmed',Transaction.business_date==day)
+          .group_by(Entry.bank_id))
+    daily={r.bank_id:r for r in db.session.execute(base).all()}
+    before=dict(db.session.execute(
+        select(Entry.bank_id,func.coalesce(func.sum(Entry.delta),0))
+        .join(Transaction,Entry.transaction_id==Transaction.id)
+        .where(Entry.bank_id.in_(ids),Transaction.status=='confirmed',Transaction.business_date<day)
+        .group_by(Entry.bank_id)).all())
+    total=dict(db.session.execute(
+        select(Entry.bank_id,func.coalesce(func.sum(Entry.delta),0))
+        .join(Transaction,Entry.transaction_id==Transaction.id)
+        .where(Entry.bank_id.in_(ids),Transaction.status=='confirmed')
+        .group_by(Entry.bank_id)).all())
+    out={}
+    for b in bank_list:
+        r=daily.get(b.id)
+        opening=money(b.opening_balance)+money(before.get(b.id,0))
+        change=money(r.delta) if r else Decimal('0.00')
+        out[b.id]={'opening':opening,'daily':change,'day_close':opening+change,
+                   'current':money(b.opening_balance)+money(total.get(b.id,0)),
+                   'in_count':int(r.in_count) if r else 0,'out_count':int(r.out_count) if r else 0,
+                   'in_amount':money(r.in_amount) if r else Decimal('0.00'),
+                   'out_amount':money(r.out_amount) if r else Decimal('0.00')}
+    return out
 
 def check_open_day(day,bank_ids):
     if day!=business_today(): raise ValueError('V1 only accepts current Malaysia business date')
@@ -695,7 +739,7 @@ def create_app(test_config=None):
         bank_pagination=Bank.query.filter(platform_scope(Bank)).order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
         end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
         history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
-        return render_template('banks.html',banks=bank_pagination.items,balances=balances() if permitted('view_bank_balances') else {},
+        return render_template('banks.html',banks=bank_pagination.items,bank_stats=bank_daily_overview(bank_pagination.items,day) if permitted('view_bank_balances') else {},balances=balances() if permitted('view_bank_balances') else {},
                                statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day)
 
     @app.post('/banks/<bank_id>/status')
@@ -778,18 +822,22 @@ def create_app(test_config=None):
                 flash('Transaction confirmed and balance updated','success');return redirect(url_for('new_transaction'))
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
         
-        balance_banks=[];balance_values={};recent=[];recent_pagination=None
+        balance_banks=[];balance_values={};bank_stats={};recent=[];recent_pagination=None
         if permitted('view_bank_balances'):
             balance_banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
-            balance_values={b.id:ledger_balance(b.id) for b in balance_banks}
+            bank_stats=bank_daily_overview(balance_banks)
+            balance_values={b.id:bank_stats[b.id]['current'] for b in balance_banks}
             bank_ids=[b.id for b in balance_banks]
             if permitted('view_bank_movements') and bank_ids:
                 movement_search=request.args.get('movement_search','').strip()[:120]
+                movement_bank=request.args.get('movement_bank','').strip()[:36]
                 movement_query=(select(Entry,Transaction,Bank.name)
                     .join(Transaction,Transaction.id==Entry.transaction_id)
                     .join(Bank,Bank.id==Entry.bank_id)
                     .where(Entry.bank_id.in_(bank_ids),Transaction.status=='confirmed',platform_scope(Transaction))
                     .order_by(Transaction.created_at.desc(),Entry.id.desc()))
+                if movement_bank in bank_ids:
+                    movement_query=movement_query.where(Entry.bank_id==movement_bank)
                 if movement_search:
                     pattern=f'%{movement_search}%'
                     movement_query=movement_query.where(db.or_(Transaction.reference.ilike(pattern),Transaction.customer_ref.ilike(pattern),Bank.name.ilike(pattern)))
@@ -800,7 +848,7 @@ def create_app(test_config=None):
                 page=min(page,total_pages)
                 recent=db.session.execute(movement_query.offset((page-1)*per_page).limit(per_page)).all()
                 recent_pagination={'page':page,'pages':total_pages,'total':movement_count,'has_prev':page>1,'has_next':page<total_pages}
-        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,recent=recent,recent_pagination=recent_pagination,movement_search=request.args.get('movement_search','').strip()[:120])
+        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36])
 
     @app.get('/workspace')
     @login_required

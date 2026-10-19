@@ -6,7 +6,7 @@
 {% for b in overview_banks %}
 {% set v=bank_stats[b.id] %}
 <tr>
-<td class="fw-semibold">{{b.name}}{% if not b.active %} <span class="badge bg-secondary">Inactive</span>{% endif %}</td>
+<td class="fw-semibold">{{b.name}}{% if b.status=='closed' %} <a class="small" href="{{url_for('blocked_settlements',bank_id=b.id)}}">Settlement</a>{% endif %}{% if not b.active %} <span class="badge bg-secondary">Inactive</span>{% endif %}</td>
 <td><span class="badge bg-light text-dark border">{{b.kind|title}}</span></td>
 <td class="text-end money">{{v.opening|rm}}</td>
 <td class="text-end money {{'text-success' if v.daily>0 else 'text-danger' if v.daily<0 else ''}}">{{'+' if v.daily>0 else ''}}{{v.daily|rm}}</td>

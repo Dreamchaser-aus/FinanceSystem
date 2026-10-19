@@ -76,6 +76,7 @@ PERMISSIONS={
     'view_dashboard_dealers':'Dashboard dealer summary',
     'view_dashboard_transactions':'Dashboard recent transactions',
     'manage_unclaimed':'Log and review unclaimed deposit leads',
+    'manage_bank_labels':'Create and assign bank labels',
 }
 DEFAULT_ROLE_PERMS={
     'staff':{'view_dashboard','view_bank_balances','view_bank_movements','create_transaction','view_transactions'},
@@ -139,6 +140,19 @@ class Bank(db.Model):
     status_updated_at=db.Column(db.DateTime(timezone=True))
     status_updated_by=db.Column(db.String(36),db.ForeignKey('user.id'))
     created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+
+class BankLabel(db.Model):
+    """Optional platform-scoped, admin-managed labels; no ledger impact."""
+    __tablename__='bank_label'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    platform_id=db.Column(db.String(36),db.ForeignKey('platform.id'),nullable=False,index=True)
+    name=db.Column(db.String(60),nullable=False)
+    __table_args__=(UniqueConstraint('platform_id','name',name='uq_bank_label_platform_name'),)
+
+class BankLabelAssignment(db.Model):
+    __tablename__='bank_label_assignment'
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),primary_key=True)
+    label_id=db.Column(db.String(36),db.ForeignKey('bank_label.id'),nullable=False,index=True)
 
 class BankStatusHistory(db.Model):
     __tablename__='bank_status_history'
@@ -716,6 +730,38 @@ def create_app(test_config=None):
             closed_banks=closed_page.items, closed_page=closed_page,
             closed_count=closed_page.total, statuses=statuses)
 
+    @app.post('/bank-labels')
+    @login_required
+    def create_bank_label():
+        require_permission('manage_bank_labels')
+        pid=require_single_platform()
+        name=request.form.get('name','').strip()[:60]
+        if not name:abort(400,description='Label name required')
+        try:
+            label=BankLabel(platform_id=pid,name=name)
+            db.session.add(label);db.session.flush()
+            db.session.add(Audit(actor_id=current_user.id,action='CREATE_BANK_LABEL',detail=f'{pid} {label.id} {name}'))
+            db.session.commit();flash('Bank tag created','success')
+        except IntegrityError:
+            db.session.rollback();flash('This tag already exists on this platform','warning')
+        return redirect(url_for('banks'))
+
+    @app.post('/banks/<bank_id>/label')
+    @login_required
+    def assign_bank_label(bank_id):
+        require_permission('manage_bank_labels')
+        pid=require_single_platform()
+        bank_for_platform(bank_id,pid)
+        label_id=request.form.get('label_id','').strip()
+        label=db.session.get(BankLabel,label_id) if label_id else None
+        if label_id and (not label or label.platform_id!=pid):abort(403)
+        assignment=db.session.get(BankLabelAssignment,bank_id)
+        if assignment:db.session.delete(assignment);db.session.flush()
+        if label:db.session.add(BankLabelAssignment(bank_id=bank_id,label_id=label.id))
+        db.session.add(Audit(actor_id=current_user.id,action='ASSIGN_BANK_LABEL',detail=f'{bank_id} label={label_id or "none"}'))
+        db.session.commit();flash('Bank tag updated','success')
+        return redirect(url_for('banks'))
+
     @app.route('/banks',methods=['GET','POST'])
     @login_required
     def banks():
@@ -736,11 +782,21 @@ def create_app(test_config=None):
         day=selected_date()
         bank_page=max(1,request.args.get('bank_page',1,type=int))
         history_page=max(1,request.args.get('history_page',1,type=int))
-        bank_pagination=Bank.query.filter(platform_scope(Bank)).order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
+        label_filter=request.args.get('label','').strip()[:36]
+        status_filter=request.args.get('status','').strip()[:30]
+        bank_query=Bank.query.filter(platform_scope(Bank))
+        if label_filter:
+            bank_query=bank_query.join(BankLabelAssignment,BankLabelAssignment.bank_id==Bank.id).join(BankLabel,BankLabel.id==BankLabelAssignment.label_id).filter(BankLabel.id==label_filter, BankLabel.platform_id==Bank.platform_id)
+        if status_filter in BANK_STATUSES:
+            bank_query=bank_query.filter(Bank.status==status_filter)
+        bank_pagination=bank_query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
         end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
         history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
         return render_template('banks.html',banks=bank_pagination.items,bank_stats=bank_daily_overview(bank_pagination.items,day) if permitted('view_bank_balances') else {},balances=balances() if permitted('view_bank_balances') else {},
-                               statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day)
+                               statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day,
+                               labels=BankLabel.query.filter(platform_scope(BankLabel)).order_by(BankLabel.name).all(),
+                               assigned_labels={a.bank_id:a.label_id for a in db.session.execute(select(BankLabelAssignment).join(Bank,Bank.id==BankLabelAssignment.bank_id).where(platform_scope(Bank))).scalars().all()},
+                               label_filter=label_filter,status_filter=status_filter)
 
     @app.post('/banks/<bank_id>/status')
     @role_required('admin','staff')
@@ -895,8 +951,32 @@ def create_app(test_config=None):
                 db.session.rollback();flash(str(exc),'danger')
             return redirect(url_for('unclaimed_deposits'))
         banks_list=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
-        rows=UnclaimedDeposit.query.filter(platform_scope(UnclaimedDeposit)).order_by(UnclaimedDeposit.created_at.desc()).limit(100).all()
-        return render_template('unclaimed.html',banks=banks_list,items=rows)
+        lead_search=request.args.get('search','').strip()[:120]
+        lead_status=request.args.get('status','unclaimed').strip()
+        lead_bank=request.args.get('bank_id','').strip()
+        q=UnclaimedDeposit.query.filter(platform_scope(UnclaimedDeposit))
+        if lead_status in ('unclaimed','claimed','dismissed'):q=q.filter(UnclaimedDeposit.status==lead_status)
+        if lead_bank and lead_bank in {b.id for b in banks_list}:q=q.filter(UnclaimedDeposit.bank_id==lead_bank)
+        if lead_search:q=q.filter(or_(UnclaimedDeposit.reference.ilike(f'%{lead_search}%'),UnclaimedDeposit.remark.ilike(f'%{lead_search}%')))
+        lead_page=max(1,request.args.get('page',1,type=int))
+        pagination=q.order_by(UnclaimedDeposit.created_at.desc(),UnclaimedDeposit.id.desc()).paginate(page=lead_page,per_page=20,error_out=False)
+        return render_template('unclaimed.html',banks=banks_list,items=pagination.items,pagination=pagination,lead_search=lead_search,lead_status=lead_status,lead_bank=lead_bank)
+
+    @app.post('/unclaimed/<lead_id>/dismiss')
+    @login_required
+    def dismiss_unclaimed(lead_id):
+        require_permission('manage_unclaimed')
+        lead=db.session.get(UnclaimedDeposit,lead_id)
+        if not lead:abort(404)
+        require_platform(lead.platform_id)
+        if lead.status!='unclaimed':abort(409,description='Only open leads can be dismissed')
+        reason=request.form.get('reason','').strip()[:500]
+        if not reason:abort(400,description='Dismissal reason required')
+        lead.status='dismissed'
+        lead.remark=((lead.remark or '')+'\nDismissed: '+reason).strip()[:2000]
+        db.session.add(Audit(actor_id=current_user.id,action='DISMISS_UNCLAIMED',detail=f'{lead.id} reason={reason}'))
+        db.session.commit();flash('Investigation dismissed; ledger unchanged','success')
+        return redirect(url_for('unclaimed_deposits'))
 
     @app.post('/unclaimed/<lead_id>/claim')
     @login_required

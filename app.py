@@ -309,6 +309,17 @@ def ledger_balance(bank_id,through=None):
 
 def business_today(): return datetime.now(MYT).date()
 
+def validate_entry_business_day(value):
+    """Only MYT today/yesterday are permitted; enforced server-side."""
+    today=business_today()
+    if value is None or value=='': return today
+    try: chosen=date.fromisoformat(str(value))
+    except (TypeError,ValueError): raise ValueError('Invalid business date')
+    if chosen not in (today,today-timedelta(days=1)):
+        raise ValueError('Transaction date must be today or yesterday (Malaysia time)')
+    return chosen
+
+
 def selected_date():
     """Read-only reporting date. Future dates and malformed dates are rejected."""
     raw = request.args.get('date', '').strip()
@@ -416,14 +427,14 @@ def lock_banks(ids):
     # Postgres row locks serialize balance checks and updates; SQLite is for local demo only.
     return db.session.execute(select(Bank).where(Bank.id.in_(sorted(set(ids)))).order_by(Bank.id).with_for_update()).scalars().all()
 
-def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_bank_id=None,platform_id=None):
+def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_bank_id=None,platform_id=None,business_day=None):
     if not reference.strip(): raise ValueError('Transaction ID required')
     if kind not in ('deposit','withdrawal','transfer'): raise ValueError('Unsupported type')
     if not platform_id: raise ValueError("Select platform")
     a=amount_positive(amount); ids=[bank_id]+([to_bank_id] if to_bank_id else [])
     if kind=='transfer' and (not to_bank_id or to_bank_id==bank_id): raise ValueError('Choose two different banks')
     if kind!='transfer' and to_bank_id: raise ValueError('Unexpected destination bank')
-    day=business_today()
+    day=validate_entry_business_day(business_day)
     try:
         bs=lock_banks(ids)
         if len(bs)!=len(ids) or any(not b.active or b.platform_id!=platform_id for b in bs): raise ValueError('Bank missing, inactive or belongs to another platform')
@@ -454,7 +465,7 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
     except Exception:
         db.session.rollback();raise
 
-def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, customer_ref='', remark='',platform_id=None):
+def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, customer_ref='', remark='',platform_id=None,business_day=None):
     if not platform_id: raise ValueError('Select platform')
     if kind not in ('dealer_sell','dealer_buy','dealer_payout'):
         raise ValueError('Unsupported dealer transaction')
@@ -469,7 +480,7 @@ def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, cu
     if kind=='dealer_payout' and not customer_ref.strip(): raise ValueError('Customer ID required')
     if kind=='dealer_payout' and bank_id: raise ValueError('Dealer direct payout must not select a bank')
     if kind!='dealer_payout' and not bank_id: raise ValueError('Select a real bank')
-    day=business_today()
+    day=validate_entry_business_day(business_day)
     try:
         dealer=db.session.execute(select(Dealer).where(Dealer.id==dealer_id).with_for_update()).scalar_one_or_none()
         if not dealer or not dealer.active or dealer.platform_id!=platform_id: raise ValueError('Dealer missing, inactive or belongs to another platform')
@@ -702,6 +713,13 @@ def create_app(test_config=None):
         totals = {k: {'count': n, 'amount': money(v)} for k, n, v in rows}
         latest = (Transaction.query.filter(Transaction.business_date.between(start_day, day),platform_scope(Transaction))
                   .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
+        platform_names = {p.id:p.name for p in Platform.query.filter(Platform.id.in_({t.platform_id for t in latest})).all()} if latest else {}
+        void_audits = (TransactionAudit.query.filter(TransactionAudit.transaction_id.in_([t.id for t in latest]),TransactionAudit.action=='VOID').order_by(TransactionAudit.created_at.desc()).all() if latest else [])
+        void_actor_ids={a.actor_id for a in void_audits}
+        void_actor_names={u.id:u.username for u in User.query.filter(User.id.in_(void_actor_ids)).all()} if void_actor_ids else {}
+        deleted_by={}
+        for audit in void_audits:
+            deleted_by.setdefault(audit.transaction_id,void_actor_names.get(audit.actor_id,'Unknown user'))
         transaction_banks = {}
         ids = [t.id for t in latest]
         if ids:
@@ -762,7 +780,7 @@ def create_app(test_config=None):
             dealer_items=dealer_items, dealer_totals=dealer_totals,
             active_customers=len(active_ids), new_customers=new_count,
             banks=bank_items, balances=bal,
-            totals=totals, latest=latest, transaction_banks=transaction_banks,
+            totals=totals, latest=latest, transaction_banks=transaction_banks, platform_names=platform_names, deleted_by=deleted_by,
             grand=active_total, page_total=sum((bal[b.id] for b in bank_items), Decimal('0')),
             bank_page=bank_page, bank_pages=bank_pages, active_count=len(active_banks),
             block_count=len(blocked), block_banks=blocked, closing_total=closing_total,
@@ -809,6 +827,7 @@ def create_app(test_config=None):
             require_permission('create_bank')
             try:
                 name=request.form.get('name','').strip()
+                chosen_day=validate_entry_business_day(request.form.get('business_date'))
                 kind=request.form.get('kind','')
                 if not name or kind not in ('deposit','withdrawal','store','other'): raise ValueError('Invalid bank details')
                 pid=require_single_platform()
@@ -911,9 +930,9 @@ def create_app(test_config=None):
                     record_dealer(kind,request.form.get('reference',''),request.form.get('amount',''),
                                   request.form.get('bank_id','') if kind!='dealer_payout' else None,
                                   current_user.id,request.form.get('dealer_id',''),request.form.get('rate',''),
-                                  request.form.get('customer_ref',''),request.form.get('remark',''),platform_id=pid)
+                                  request.form.get('customer_ref',''),request.form.get('remark',''),platform_id=pid,business_day=chosen_day)
                 else:
-                    record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None,platform_id=pid)
+                    record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None,platform_id=pid,business_day=chosen_day)
                 flash('Transaction confirmed and balance updated','success');return redirect(url_for('new_transaction'))
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
         
@@ -943,7 +962,7 @@ def create_app(test_config=None):
                 page=min(page,total_pages)
                 recent=db.session.execute(movement_query.offset((page-1)*per_page).limit(per_page)).all()
                 recent_pagination={'page':page,'pages':total_pages,'total':movement_count,'has_prev':page>1,'has_next':page<total_pages}
-        return render_template('transaction.html',banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36])
+        return render_template('transaction.html',entry_today=business_today().isoformat(),entry_yesterday=(business_today()-timedelta(days=1)).isoformat(),banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36])
 
     @app.get('/banks/<bank_id>/investigation')
     @login_required

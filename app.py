@@ -232,6 +232,24 @@ class UnclaimedDeposit(db.Model):
     bank=db.relationship('Bank')
     __table_args__=(UniqueConstraint('bank_id','reference',name='uq_unclaimed_bank_reference'),)
 
+class BlockedUnclaimedSettlement(db.Model):
+    """Immutable point-in-time bank block snapshot; never posts ledger entries."""
+    __tablename__='blocked_unclaimed_settlement'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    platform_id=db.Column(db.String(36),db.ForeignKey('platform.id'),nullable=False,index=True)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
+    status_history_id=db.Column(db.String(36),db.ForeignKey('bank_status_history.id'),nullable=False,unique=True)
+    actor_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
+    ledger_balance=db.Column(db.Numeric(18,2),nullable=False)
+    unclaimed_amount=db.Column(db.Numeric(18,2),nullable=False)
+    unclaimed_count=db.Column(db.Integer,nullable=False)
+    with_unclaimed=db.Column(db.Numeric(18,2),nullable=False)
+    leads_json=db.Column(db.Text,nullable=False)
+    remark=db.Column(db.Text)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+    bank=db.relationship('Bank')
+    actor=db.relationship('User')
+
 class Closing(db.Model):
     id=db.Column(db.String(36),primary_key=True,default=idgen)
     bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False)
@@ -433,7 +451,7 @@ def bank_daily_overview(bank_list, day=None):
         opening=money(b.opening_balance)+money(before.get(b.id,0))
         change=money(r.delta) if r else Decimal('0.00')
         out[b.id]={'opening':opening,'daily':change,'day_close':opening+change,
-                   'current':money(b.opening_balance)+money(total.get(b.id,0))+pending.get(b.id,Decimal('0.00')),
+                   'current':money(b.opening_balance)+money(total.get(b.id,0)),
                    'unclaimed':pending.get(b.id,Decimal('0.00')),
                    'in_count':int(r.in_count) if r else 0,'out_count':int(r.out_count) if r else 0,
                    'in_amount':money(r.in_amount) if r else Decimal('0.00'),
@@ -725,8 +743,8 @@ def create_app(test_config=None):
         blocked = [b for b in existing if statuses[b.id] == 'closed']
         active_banks = [b for b in existing if statuses[b.id] == 'active']
         dashboard_bank_stats = bank_daily_overview(active_banks, day)
-        closing_total = sum((display_bal[b.id] for b in existing if statuses[b.id] != 'closed'), Decimal('0'))
-        active_total = sum((display_bal[b.id] for b in active_banks), Decimal('0'))
+        closing_total = sum((bal[b.id] for b in existing if statuses[b.id] != 'closed'), Decimal('0'))
+        active_total = sum((bal[b.id] for b in active_banks), Decimal('0'))
         start = (bank_page - 1) * 10
         bank_items = active_banks[start:start + 10]
         bank_pages = max(1, (len(active_banks) + 9) // 10)
@@ -807,7 +825,11 @@ def create_app(test_config=None):
             active_customers=len(active_ids), new_customers=new_count,
             banks=bank_items, balances=display_bal, dashboard_bank_stats=dashboard_bank_stats, dashboard_unclaimed=unclaimed_components,
             totals=totals, latest=latest, transaction_banks=transaction_banks, platform_names=platform_names, deleted_by=deleted_by,
-            grand=active_total, page_total=sum((display_bal[b.id] for b in bank_items), Decimal('0')),
+            grand=active_total, page_total=sum((bal[b.id] for b in bank_items), Decimal('0')),
+            page_with_unclaimed=sum((display_bal[b.id] for b in bank_items), Decimal('0')),
+            active_with_unclaimed=sum((display_bal[b.id] for b in active_banks), Decimal('0')),
+            total_unclaimed=sum((unclaimed_components.get(b.id, Decimal('0')) for b in active_banks), Decimal('0')),
+            ledger_balances=bal,
             bank_page=bank_page, bank_pages=bank_pages, active_count=len(active_banks),
             block_count=len(blocked), block_banks=blocked, closing_total=closing_total,
             closed_banks=closed_page.items, closed_page=closed_page,
@@ -911,8 +933,25 @@ def create_app(test_config=None):
             bank.status_updated_by=current_user.id
             # Legacy active flag stays synchronized for older code paths.
             bank.active=(new_status!='closed')
-            db.session.add(BankStatusHistory(bank_id=bank.id,actor_id=current_user.id,
-                                             old_status=old_status,new_status=new_status,remark=remark or None))
+            status_event=BankStatusHistory(bank_id=bank.id,actor_id=current_user.id,
+                                           old_status=old_status,new_status=new_status,remark=remark or None)
+            db.session.add(status_event)
+            db.session.flush()  # assign status history ID before snapshot FK
+            if new_status=='closed' and old_status!='closed':
+                # Lock pending leads so their status cannot change during the snapshot.
+                leads=(UnclaimedDeposit.query.filter_by(bank_id=bank.id,platform_id=bank.platform_id,status='unclaimed')
+                       .order_by(UnclaimedDeposit.id).with_for_update().all())
+                ledger=ledger_balance(bank.id)
+                pending=sum((money(x.amount) for x in leads),Decimal('0.00'))
+                snapshot=[{'id':x.id,'reference':x.reference,'amount':str(money(x.amount)),
+                           'created_at':x.created_at.isoformat() if x.created_at else None} for x in leads]
+                db.session.add(BlockedUnclaimedSettlement(
+                    platform_id=bank.platform_id,bank_id=bank.id,status_history_id=status_event.id,
+                    actor_id=current_user.id,ledger_balance=ledger,unclaimed_amount=pending,
+                    unclaimed_count=len(leads),with_unclaimed=ledger+pending,
+                    leads_json=json.dumps(snapshot,ensure_ascii=False),remark=remark or None))
+                db.session.add(Audit(actor_id=current_user.id,action='BLOCKED_UNCLAIMED_SNAPSHOT',
+                    detail=f'bank={bank.id} leads={len(leads)} unclaimed={pending} ledger={ledger}'))
             db.session.add(Audit(actor_id=current_user.id,action='UPDATE_BANK_STATUS',
                                  detail=f'{bank.id}: {old_status} -> {new_status}; reason={remark[:500]}'))
             db.session.commit()
@@ -921,6 +960,15 @@ def create_app(test_config=None):
             db.session.rollback()
             raise
         return redirect(url_for('banks'))
+
+    @app.get('/banks/<bank_id>/blocked-settlements')
+    @login_required
+    def blocked_settlements(bank_id):
+        require_permission('view_bank_balances')
+        bank=bank_for_platform(bank_id,require_single_platform())
+        records=(BlockedUnclaimedSettlement.query.filter_by(bank_id=bank.id,platform_id=bank.platform_id)
+                 .order_by(BlockedUnclaimedSettlement.created_at.desc()).all())
+        return render_template('blocked_settlements.html',bank=bank,records=records,json=json)
 
     @app.route('/dealers',methods=['GET','POST'])
     @login_required
@@ -1075,7 +1123,8 @@ def create_app(test_config=None):
             pid=require_single_platform()
             try:
                 bank_id=request.form.get('bank_id','')
-                bank_for_platform(bank_id,pid)
+                lead_bank=bank_for_platform(bank_id,pid)
+                if lead_bank.status=='closed':raise ValueError('Blocked bank: cannot record new unclaimed leads')
                 amount=amount_positive(request.form.get('amount',''))
                 reference=request.form.get('reference','').strip()[:120]
                 if not reference:raise ValueError('Bank reference is required')
@@ -1084,7 +1133,7 @@ def create_app(test_config=None):
                     reference=reference,remark=request.form.get('remark','').strip()[:2000],created_by=current_user.id)
                 db.session.add(obj);db.session.flush()
                 db.session.add(Audit(actor_id=current_user.id,action='LOG_UNCLAIMED',detail=f'{obj.id} bank={bank_id}'))
-                db.session.commit();flash('Unclaimed deposit lead recorded; bank balance unchanged','success')
+                db.session.commit();flash('Unclaimed recorded for selected bank; confirmed ledger unchanged','success')
             except (ValueError,IntegrityError) as exc:
                 db.session.rollback();flash(str(exc),'danger')
             return redirect(url_for('unclaimed_deposits'))
@@ -1107,6 +1156,7 @@ def create_app(test_config=None):
         lead=db.session.get(UnclaimedDeposit,lead_id)
         if not lead:abort(404)
         require_platform(lead.platform_id)
+        if lead.bank.status=='closed':abort(409,description='Blocked bank: unclaimed lead frozen for settlement review')
         if lead.status!='unclaimed':abort(409,description='Only open leads can be dismissed')
         reason=request.form.get('reason','').strip()[:500]
         if not reason:abort(400,description='Dismissal reason required')
@@ -1123,6 +1173,7 @@ def create_app(test_config=None):
         lead=db.session.get(UnclaimedDeposit,lead_id)
         if not lead:abort(404)
         require_platform(lead.platform_id)
+        if lead.bank.status=='closed':abort(409,description='Blocked bank: unclaimed lead frozen for settlement review')
         transaction_ref=request.form.get('transaction_reference','').strip()
         if not transaction_ref:abort(400,description='Provide a confirmed deposit transaction reference')
         tx=Transaction.query.filter_by(reference=transaction_ref,platform_id=lead.platform_id,

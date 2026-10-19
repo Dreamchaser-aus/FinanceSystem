@@ -1012,7 +1012,7 @@ def create_app(test_config=None):
         
         balance_banks=[];balance_values={};bank_stats={};recent=[];recent_pagination=None
         if permitted('view_bank_balances'):
-            balance_banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
+            balance_banks=Bank.query.filter(platform_scope(Bank), Bank.status=='active', Bank.active==True).order_by(Bank.name).all()
             bank_stats=bank_daily_overview(balance_banks)
             balance_values={b.id:bank_stats[b.id]['current'] for b in balance_banks}
             bank_ids=[b.id for b in balance_banks]

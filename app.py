@@ -10,6 +10,7 @@ from flask_wtf.csrf import CSRFProtect
 from sqlalchemy import func, select, UniqueConstraint, or_, and_, case
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
+from cryptography.fernet import Fernet, InvalidToken
 
 MYT=ZoneInfo(os.getenv('BUSINESS_TIMEZONE','Asia/Kuala_Lumpur'))
 db=SQLAlchemy(); login_manager=LoginManager(); csrf=CSRFProtect()
@@ -70,6 +71,9 @@ PERMISSIONS={
     'view_bank_balances':'View all bank balances in assigned platform',
     'view_bank_movements':'View recent bank movements',
     'create_bank':'Create bank with zero opening balance',
+    'view_bank_details':'View bank account details',
+    'view_sensitive_bank_details':'View bank login credentials',
+    'edit_bank_details':'Edit bank account details',
     'view_dashboard_customers':'Dashboard customer statistics',
     'view_dashboard_financials':'Dashboard financial summary',
     'view_dashboard_closing':'Dashboard closing details',
@@ -141,6 +145,85 @@ class Bank(db.Model):
     status_updated_at=db.Column(db.DateTime(timezone=True))
     status_updated_by=db.Column(db.String(36),db.ForeignKey('user.id'))
     created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+
+class BankDetail(db.Model):
+    __tablename__='bank_detail'
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),primary_key=True)
+    payid=db.Column(db.String(180))
+    bsb_number=db.Column(db.String(12))
+    account_number=db.Column(db.String(40))
+    phone_number=db.Column(db.String(40))
+    date_of_birth=db.Column(db.String(20))
+    card_details=db.Column(db.String(120))  # Masked card identifier only, never full PAN
+    expiry_date=db.Column(db.String(12))
+    login_id=db.Column(db.String(180))
+    login_password_cipher=db.Column(db.Text)
+    otp_api_link=db.Column(db.Text)
+    remark=db.Column(db.Text)
+    updated_by=db.Column(db.String(36),db.ForeignKey('user.id'))
+    updated_at=db.Column(db.DateTime(timezone=True),default=now)
+
+class BankEncryptionKey(db.Model):
+    """Persistent, single-purpose Fernet key stored in the Railway PostgreSQL database.
+
+    Back up the PostgreSQL database securely: losing this row makes saved credentials unreadable.
+    """
+    __tablename__='bank_encryption_key'
+    id=db.Column(db.Integer,primary_key=True)
+    key_value=db.Column(db.String(128),nullable=False)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+
+
+def initialize_bank_encryption_key():
+    """Run during Railway bootstrap; insert exactly once even with concurrent deploys."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    configured=os.getenv('BANK_DETAILS_ENCRYPTION_KEY','').strip()
+    if configured:
+        try: Fernet(configured.encode('ascii'))
+        except (ValueError,TypeError) as exc: raise RuntimeError('Invalid existing BANK_DETAILS_ENCRYPTION_KEY') from exc
+    candidate=configured or Fernet.generate_key().decode('ascii')
+    if db.engine.dialect.name=='postgresql':
+        statement=pg_insert(BankEncryptionKey).values(id=1,key_value=candidate).on_conflict_do_nothing(index_elements=['id'])
+        db.session.execute(statement)
+        db.session.commit()
+    else:
+        if db.session.get(BankEncryptionKey,1) is None:
+            db.session.add(BankEncryptionKey(id=1,key_value=candidate))
+            db.session.commit()
+    saved=db.session.get(BankEncryptionKey,1)
+    if configured and saved.key_value!=configured:
+        raise RuntimeError('Existing Railway key differs from stored key; stop to protect encrypted passwords')
+    Fernet(saved.key_value.encode('ascii'))
+    print('Bank details encryption key ready in persistent PostgreSQL storage')
+
+
+def bank_cipher():
+    saved=db.session.get(BankEncryptionKey,1)
+    if saved is None:
+        raise RuntimeError('Bank encryption key not initialized; run Railway bootstrap')
+    return Fernet(saved.key_value.encode('ascii'))
+
+BANK_DETAIL_FIELDS=('payid','bsb_number','account_number','phone_number','date_of_birth','card_details','expiry_date','login_id','otp_api_link','remark')
+
+def save_bank_detail(bank,form):
+    detail=db.session.get(BankDetail,bank.id)
+    if detail is None:
+        detail=BankDetail(bank_id=bank.id)
+        db.session.add(detail)
+    for field in BANK_DETAIL_FIELDS:
+        if field in form:
+            value=form.get(field,'').strip()
+            limit=2000 if field in ('otp_api_link','remark') else 180
+            if len(value)>limit: raise ValueError(f'{field} exceeds maximum length')
+            if field=='card_details' and value:
+                if not (value.isascii() and value.isdigit() and len(value)==4):
+                    raise ValueError('Card Last 4 Digits must contain exactly four digits')
+            setattr(detail,field,value or None)
+    if 'login_password' in form and form.get('login_password'):
+        detail.login_password_cipher=bank_cipher().encrypt(form['login_password'].encode()).decode()
+    detail.updated_by=current_user.id
+    detail.updated_at=now()
+    return detail
 
 class BankLabel(db.Model):
     """Optional platform-scoped, admin-managed labels; no ledger impact."""
@@ -588,6 +671,7 @@ def create_app(test_config=None):
         if not username or len(password)<12:
             raise RuntimeError('Set ADMIN_USER and ADMIN_PASS (at least 12 characters)')
         db.create_all()
+        initialize_bank_encryption_key()
         if not User.query.filter_by(role='admin').first():
             if User.query.filter_by(username=username).first():
                 raise RuntimeError('ADMIN_USER already exists without admin role')
@@ -880,6 +964,7 @@ def create_app(test_config=None):
                 pid=require_single_platform()
                 b=Bank(platform_id=pid,name=name,kind=kind,opening_balance=money(request.form.get('opening_balance','0')) if current_user.role=='admin' else Decimal('0'))
                 db.session.add(b);db.session.flush()
+                save_bank_detail(b,request.form)
                 db.session.add(Audit(actor_id=current_user.id,action='CREATE_BANK',detail=f'{b.id} {name}'))
                 db.session.commit();flash('Bank created','success')
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
@@ -902,6 +987,38 @@ def create_app(test_config=None):
                                labels=BankLabel.query.filter(platform_scope(BankLabel)).order_by(BankLabel.name).all(),
                                assigned_labels={a.bank_id:a.label_id for a in db.session.execute(select(BankLabelAssignment).join(Bank,Bank.id==BankLabelAssignment.bank_id).where(platform_scope(Bank))).scalars().all()},
                                label_filter=label_filter,status_filter=status_filter)
+
+    @app.route('/banks/<bank_id>/details',methods=['GET','POST'])
+    @login_required
+    def bank_details(bank_id):
+        bank=bank_for_platform(bank_id,require_single_platform())
+        require_permission('edit_bank_details' if request.method=='POST' else 'view_bank_details')
+        detail=db.session.get(BankDetail,bank.id)
+        if request.method=='POST':
+            try:
+                save_bank_detail(bank,request.form)
+                db.session.add(Audit(actor_id=current_user.id,action='EDIT_BANK_DETAILS',detail=f'bank={bank.id}; fields={",".join(k for k in BANK_DETAIL_FIELDS if k in request.form)}; password_changed={bool(request.form.get("login_password"))}'))
+                db.session.commit();flash('Bank details updated','success')
+            except ValueError as e:
+                db.session.rollback();flash(str(e),'danger')
+            return redirect(url_for('bank_details',bank_id=bank.id))
+        return render_template('bank_details.html',bank=bank,detail=detail,can_sensitive=permitted('view_sensitive_bank_details'))
+
+    @app.post('/banks/<bank_id>/details/reveal')
+    @login_required
+    def reveal_bank_password(bank_id):
+        bank=bank_for_platform(bank_id,require_single_platform())
+        require_permission('view_sensitive_bank_details')
+        detail=db.session.get(BankDetail,bank.id)
+        password=None
+        if detail and detail.login_password_cipher:
+            try: password=bank_cipher().decrypt(detail.login_password_cipher.encode()).decode()
+            except InvalidToken: abort(500,'Unable to decrypt stored credential')
+        db.session.add(Audit(actor_id=current_user.id,action='REVEAL_BANK_PASSWORD',detail=f'bank={bank.id}'))
+        db.session.commit()
+        response=app.make_response(render_template('bank_password_reveal.html',bank=bank,password=password))
+        response.headers['Cache-Control']='no-store, private'
+        return response
 
     @app.post('/banks/<bank_id>/status')
     @role_required('admin','staff')

@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<div class="card p-4"><h3>Dashboard</h3><p class="text-muted">Your account does not have access to any dashboard cards. Use the staff workspace for authorized tasks.</p>{% if can('view_bank_balances') %}<a class="btn btn-primary" href="{{url_for('workspace')}}">Bank Balances</a>{% endif %}</div>{% endblock %}

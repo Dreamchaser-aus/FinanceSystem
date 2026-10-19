@@ -700,7 +700,7 @@ def create_app(test_config=None):
             .where(Transaction.business_date.between(start_day, day), Transaction.status == 'confirmed',platform_scope(Transaction))
             .group_by(Transaction.kind)).all()
         totals = {k: {'count': n, 'amount': money(v)} for k, n, v in rows}
-        latest = (Transaction.query.filter(Transaction.status=='confirmed', Transaction.business_date.between(start_day, day),platform_scope(Transaction))
+        latest = (Transaction.query.filter(Transaction.business_date.between(start_day, day),platform_scope(Transaction))
                   .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
         transaction_banks = {}
         ids = [t.id for t in latest]
@@ -747,7 +747,7 @@ def create_app(test_config=None):
             select(DealerTrade.dealer_id, DealerTrade.flow,
                    func.sum(DealerTrade.aud_amount), func.sum(DealerTrade.myr_delta))
             .join(Transaction, Transaction.id == DealerTrade.transaction_id)
-            .where(Transaction.status == 'confirmed',platform_scope(Transaction))
+            .where(Transaction.status == 'confirmed',Transaction.business_date.between(start_day,day),platform_scope(Transaction))
             .group_by(DealerTrade.dealer_id, DealerTrade.flow)
         ).all()
         dealer_totals = {}
@@ -831,7 +831,7 @@ def create_app(test_config=None):
         bank_pagination=bank_query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
         end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=MYT).astimezone(timezone.utc)
         history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
-        return render_template('banks.html',banks=bank_pagination.items,bank_stats=bank_daily_overview(bank_pagination.items,day) if permitted('view_bank_balances') else {},balances=balances() if permitted('view_bank_balances') else {},
+        return render_template('banks.html',banks=bank_pagination.items,bank_stats=bank_daily_overview(bank_pagination.items,day) if permitted('view_bank_balances') else {},balances=balances_through(day) if permitted('view_bank_balances') else {},
                                statuses=BANK_STATUSES,history=history_pagination.items,bank_pagination=bank_pagination,history_pagination=history_pagination,selected_day=day,
                                labels=BankLabel.query.filter(platform_scope(BankLabel)).order_by(BankLabel.name).all(),
                                assigned_labels={a.bank_id:a.label_id for a in db.session.execute(select(BankLabelAssignment).join(Bank,Bank.id==BankLabelAssignment.bank_id).where(platform_scope(Bank))).scalars().all()},
@@ -1195,7 +1195,7 @@ def create_app(test_config=None):
         bank_names={b.id:b.name for b in Bank.query.filter(Bank.id.in_(bank_ids),Bank.platform_id==item.platform_id).all()} if bank_ids else {}
         user_names={u.id:u.username for u in User.query.filter(User.id.in_(user_ids)).all()} if user_ids else {}
         return render_template('transaction_audit_detail.html',item=item,before=before,after=after,
-            bank_names=bank_names,user_names=user_names)
+            bank_names=bank_names,user_names=user_names,platform_name=(db.session.get(Platform,item.platform_id).name if db.session.get(Platform,item.platform_id) else 'Unknown Platform'))
 
     @app.route('/transactions/<transaction_id>/edit', methods=['GET','POST'])
     @role_required('admin','staff')
@@ -1307,6 +1307,16 @@ def create_app(test_config=None):
             flash('Transaction voided; balances recalculated. History preserved.','success')
         except (ValueError,IntegrityError) as e:
             db.session.rollback();flash(str(e),'danger')
+        destination=request.form.get('return_to','')
+        if destination=='dashboard':
+            start=request.form.get('start_date','')
+            end=request.form.get('end_date','')
+            try:
+                a=date.fromisoformat(start);b=date.fromisoformat(end)
+                if a<=b<=business_today() and (b-a).days<=365:
+                    return redirect(url_for('dashboard',start_date=a.isoformat(),end_date=b.isoformat()))
+            except (ValueError,TypeError):pass
+            return redirect(url_for('dashboard'))
         return redirect(url_for('transactions'))
 
     @app.route('/closing',methods=['GET','POST'])

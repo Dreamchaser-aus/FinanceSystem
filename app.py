@@ -1270,7 +1270,22 @@ def create_app(test_config=None):
         if actor:q=q.join(User,User.id==TransactionAudit.actor_id).filter(User.username.ilike(f'%{actor}%'))
         page=max(1,request.args.get('page',1,type=int))
         logs=q.order_by(TransactionAudit.created_at.desc(),TransactionAudit.id.desc()).paginate(page=page,per_page=25,error_out=False)
-        return render_template('transaction_audit.html',logs=logs,reference=reference,action=action,actor=actor)
+        category=request.args.get('category','transactions').strip()
+        bank_logs=None
+        staff_logs=None
+        if category=='bank_status':
+            bank_q=BankStatusHistory.query.join(Bank,Bank.id==BankStatusHistory.bank_id).filter(platform_scope(Bank))
+            if actor:bank_q=bank_q.join(User,User.id==BankStatusHistory.actor_id).filter(User.username.ilike(f'%{actor}%'))
+            bank_logs=bank_q.order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=page,per_page=25,error_out=False)
+        elif category=='staff':
+            # Account management events are separate from bank status and transaction history.
+            # General Audit has no platform_id: restrict these records to administrators.
+            if current_user.role!='admin':abort(403)
+            staff_q=Audit.query.filter(db.or_(Audit.action.ilike('%STAFF%'),Audit.action.ilike('%USER%'),Audit.action.ilike('%PERMISSION%')))
+            staff_logs=staff_q.order_by(Audit.created_at.desc(),Audit.id.desc()).paginate(page=page,per_page=25,error_out=False)
+        elif category!='transactions':
+            category='transactions'
+        return render_template('transaction_audit.html',logs=logs,reference=reference,action=action,actor=actor,category=category,bank_logs=bank_logs,staff_logs=staff_logs,statuses=BANK_STATUSES)
 
     @app.get('/audit/transactions/<audit_id>')
     @login_required

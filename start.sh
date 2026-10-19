@@ -5,7 +5,7 @@ set -eu
 : "${ADMIN_USER:?Set ADMIN_USER}"
 : "${ADMIN_PASS:?Set ADMIN_PASS}"
 export COOKIE_SECURE=1
-echo "Starting BankFlow V7.2..."
+echo "Starting BankFlow V7.6.1..."
 echo "Initializing PostgreSQL database..."
 flask --app app bootstrap
 echo "Applying bank status migration..."

@@ -747,7 +747,7 @@ def create_app(test_config=None):
                 if minutes < -720 or minutes > 840 or minutes%30!=0:
                     raise ValueError('Select a valid GMT offset')
                 previous=timezone_at()
-                if previous.utcoffset(None)==timedelta(minutes=minutes):
+                if previous.utcoffset(now())==timedelta(minutes=minutes):
                     flash('Timezone is already selected','info')
                 else:
                     change=BusinessTimezoneChange(offset_minutes=minutes,actor_id=current_user.id,effective_at=now())
@@ -760,7 +760,7 @@ def create_app(test_config=None):
             return redirect(url_for('manage_timezone'))
         current=timezone_at()
         history=BusinessTimezoneChange.query.order_by(BusinessTimezoneChange.effective_at.desc()).limit(30).all()
-        return render_template('timezone_settings.html',offset_minutes=int(current.utcoffset(None).total_seconds()//60),history=history)
+        return render_template('timezone_settings.html',offset_minutes=int(current.utcoffset(now()).total_seconds()//60),history=history)
 
     @app.route('/admin/platforms',methods=['GET','POST'])
     @role_required('admin')

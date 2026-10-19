@@ -1,4 +1,4 @@
-import os, uuid
+import os, uuid, json
 from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
@@ -77,6 +77,7 @@ PERMISSIONS={
     'view_dashboard_transactions':'Dashboard recent transactions',
     'manage_unclaimed':'Log and review unclaimed deposit leads',
     'manage_bank_labels':'Create and assign bank labels',
+    'view_audit_logs':'View transaction audit trail for authorized platforms',
 }
 DEFAULT_ROLE_PERMS={
     'staff':{'view_dashboard','view_bank_balances','view_bank_movements','create_transaction','view_transactions'},
@@ -251,6 +252,40 @@ class Audit(db.Model):
     detail=db.Column(db.Text)
     created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
 
+class TransactionAudit(db.Model):
+    """Append-only application audit; created in same DB transaction as ledger changes."""
+    __tablename__='transaction_audit'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    platform_id=db.Column(db.String(36),db.ForeignKey('platform.id'),nullable=False,index=True)
+    transaction_id=db.Column(db.String(36),db.ForeignKey('transaction.id'),nullable=False,index=True)
+    actor_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False,index=True)
+    action=db.Column(db.String(30),nullable=False,index=True)
+    before_json=db.Column(db.Text)
+    after_json=db.Column(db.Text)
+    reason=db.Column(db.Text)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now,index=True)
+    actor=db.relationship('User')
+    transaction=db.relationship('Transaction')
+
+
+def transaction_snapshot(tx, entries=None):
+    if entries is None:
+        entries=Entry.query.filter_by(transaction_id=tx.id).order_by(Entry.bank_id,Entry.id).all()
+    return {'id':tx.id,'platform_id':tx.platform_id,'reference':tx.reference,
+            'kind':tx.kind,'signed_amount':str(tx.signed_amount),'status':tx.status,
+            'customer_ref':tx.customer_ref,'remark':tx.remark,
+            'business_date':tx.business_date.isoformat() if tx.business_date else None,
+            'created_by':tx.created_by,
+            'entries':[{'bank_id':e.bank_id,'delta':str(e.delta)} for e in entries]}
+
+
+def write_transaction_audit(tx,actor_id,action,before=None,after=None,reason=None):
+    db.session.add(TransactionAudit(platform_id=tx.platform_id,transaction_id=tx.id,
+        actor_id=actor_id,action=action,
+        before_json=json.dumps(before,ensure_ascii=False,sort_keys=True) if before is not None else None,
+        after_json=json.dumps(after,ensure_ascii=False,sort_keys=True) if after is not None else None,
+        reason=reason))
+
 def role_required(*roles):
     def outer(fn):
         @wraps(fn)
@@ -411,6 +446,8 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
         db.session.add(t);db.session.flush()
         db.session.add(Entry(transaction_id=t.id,bank_id=bank_id,delta=delta))
         if kind=='transfer': db.session.add(Entry(transaction_id=t.id,bank_id=to_bank_id,delta=a))
+        db.session.flush()
+        write_transaction_audit(t,user_id,'CREATE',after=transaction_snapshot(t))
         db.session.add(Audit(actor_id=user_id,action='CREATE_TRANSACTION',detail=f'{t.id} {kind} {reference}'))
         db.session.commit()
         return t
@@ -454,6 +491,8 @@ def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, cu
         if bank_id: db.session.add(Entry(transaction_id=t.id,bank_id=bank_id,delta=delta))
         db.session.add(DealerTrade(transaction_id=t.id,dealer_id=dealer_id,aud_amount=aud,rate=fx,
                         myr_amount=myr,myr_delta=myr if kind=='dealer_sell' else -myr,flow=kind))
+        db.session.flush()
+        write_transaction_audit(t,user_id,'CREATE',after=transaction_snapshot(t))
         db.session.add(Audit(actor_id=user_id,action='CREATE_DEALER_TRANSACTION',detail=f'{t.id} {kind} {reference} AUD={aud} rate={fx} MYR={myr}'))
         db.session.commit()
         return t
@@ -1111,6 +1150,47 @@ def create_app(test_config=None):
                                banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all(),
                                search=search, kinds=kinds, bank_id=bank_id, selected_day=day)
 
+    @app.get('/audit/transactions')
+    @login_required
+    def transaction_audit_list():
+        require_permission('view_audit_logs')
+        # Admin may view all; staff always restricted to currently authorized platform(s).
+        q=TransactionAudit.query.join(Transaction,Transaction.id==TransactionAudit.transaction_id)
+        if current_user.role!='admin':
+            allowed=permitted_platform_ids()
+            if not allowed:abort(403)
+            q=q.filter(TransactionAudit.platform_id.in_(allowed))
+            chosen=selected_platform_id()
+            if chosen:q=q.filter(TransactionAudit.platform_id==chosen)
+        else:
+            chosen=selected_platform_id()
+            if chosen:q=q.filter(TransactionAudit.platform_id==chosen)
+        reference=request.args.get('reference','').strip()[:120]
+        action=request.args.get('action','').strip().upper()
+        actor=request.args.get('actor','').strip()[:80]
+        if reference:q=q.filter(Transaction.reference.ilike(f'%{reference}%'))
+        if action in ('CREATE','EDIT','VOID'):q=q.filter(TransactionAudit.action==action)
+        if actor:q=q.join(User,User.id==TransactionAudit.actor_id).filter(User.username.ilike(f'%{actor}%'))
+        page=max(1,request.args.get('page',1,type=int))
+        logs=q.order_by(TransactionAudit.created_at.desc(),TransactionAudit.id.desc()).paginate(page=page,per_page=25,error_out=False)
+        return render_template('transaction_audit.html',logs=logs,reference=reference,action=action,actor=actor)
+
+    @app.get('/audit/transactions/<audit_id>')
+    @login_required
+    def transaction_audit_detail(audit_id):
+        require_permission('view_audit_logs')
+        item=db.session.get(TransactionAudit,audit_id)
+        if not item:abort(404)
+        if current_user.role!='admin':
+            if item.platform_id not in permitted_platform_ids():abort(403)
+            if selected_platform_id()!=item.platform_id:abort(403)
+        else:
+            chosen=selected_platform_id()
+            if chosen and chosen!=item.platform_id:abort(403)
+        return render_template('transaction_audit_detail.html',item=item,
+            before=json.loads(item.before_json) if item.before_json else None,
+            after=json.loads(item.after_json) if item.after_json else None)
+
     @app.route('/transactions/<transaction_id>/edit', methods=['GET','POST'])
     @role_required('admin','staff')
     def edit_transaction(transaction_id):
@@ -1171,6 +1251,7 @@ def create_app(test_config=None):
             for bid in affected:
                 projected=ledger_balance(bid)-old_deltas.get(bid,Decimal('0'))+new_deltas.get(bid,Decimal('0'))
                 if projected<0: raise ValueError(f'Insufficient balance after edit: {banks_by_id[bid].name}')
+            before_snapshot=transaction_snapshot(t,old_entries)
             before=f'{t.reference} {t.kind} {t.signed_amount} entries={[(e.bank_id,str(e.delta)) for e in old_entries]}'
             for e in old_entries: db.session.delete(e)
             db.session.flush()
@@ -1178,6 +1259,8 @@ def create_app(test_config=None):
             t.reference=reference;t.kind=kind;t.signed_amount=amount if kind=='deposit' else -amount
             t.customer_ref=request.form.get('customer_ref','').strip()[:120] or None
             t.remark=request.form.get('remark','').strip()[:2000]
+            db.session.flush()
+            write_transaction_audit(t,current_user.id,'EDIT',before=before_snapshot,after=transaction_snapshot(t))
             db.session.add(Audit(actor_id=current_user.id,action='EDIT_TRANSACTION',detail=f'{t.id} BEFORE {before} AFTER {reference} {kind} {amount} entries={[(k,str(v)) for k,v in new_deltas.items()]}'))
             db.session.commit()
             flash('Transaction updated and balances recalculated','success')
@@ -1210,7 +1293,9 @@ def create_app(test_config=None):
             for b in banks:
                 if ledger_balance(b.id)-by_bank.get(b.id,Decimal('0'))<0:
                     raise ValueError(f'Cannot void: {b.name} would have a negative balance')
+            before_snapshot=transaction_snapshot(t,entries)
             t.status='voided'
+            write_transaction_audit(t,current_user.id,'VOID',before=before_snapshot,after=transaction_snapshot(t,entries),reason=reason[:500])
             db.session.add(Audit(actor_id=current_user.id,action='VOID_TRANSACTION',detail=f'{t.id} {t.reference}; reason={reason[:500]}'))
             db.session.commit()
             flash('Transaction voided; balances recalculated. History preserved.','success')

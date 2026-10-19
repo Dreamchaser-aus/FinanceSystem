@@ -24,8 +24,8 @@
       <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th class="text-end">Amount</th><th>Actions</th></tr></thead>
       <tbody>
       {% for t in records.items %}
-        <tr>
-          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} MYT</div>{% if t.status=='voided' %}<span class="badge bg-secondary">Voided</span>{% endif %}</td>
+        <tr class="{{'table-danger' if t.status=='voided' else ''}}">
+          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} MYT</div>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span>{% endif %}</td>
           <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
             {% if t.kind == 'deposit' %}<span class="badge bg-success">Deposit</span>
             {% elif t.kind == 'withdrawal' %}<span class="badge bg-danger">Withdrawal</span>

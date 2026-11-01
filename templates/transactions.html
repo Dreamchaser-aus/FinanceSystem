@@ -10,7 +10,7 @@
     
     <div class="mb-3"><input class="form-control" name="search" value="{{ search }}" placeholder="Search customer, transaction ID or bank..." aria-label="Search transactions"></div>
     <div class="d-flex flex-wrap gap-3 mb-3"><span class="fw-semibold">Types:</span>
-      {% for value,label in [('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer'),('cash_in','Cash In'),('cash_out','Cash Out'),('internal_transfer','Internal Transfer')] %}
+      {% for value,label in [('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer'),('cash_in','Cash In'),('cash_out','Cash Out'),('internal_transfer','Internal Transfer'),('dealer_buy','Dealer Buy AUD'),('dealer_sell','Dealer Sell AUD'),('dealer_payout','Dealer Payout')] %}
       <label class="form-check"><input class="form-check-input" type="checkbox" name="kind" value="{{value}}" {% if value in kinds %}checked{% endif %}><span class="form-check-label">{{label}}</span></label>
       {% endfor %}<span class="text-muted small">None checked = All types</span></div>
     <div class="d-flex flex-wrap align-items-end gap-2 mb-3 bf-compact-filters">
@@ -33,9 +33,13 @@
           <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
             {% if t.kind in ('deposit','cash_in') %}<span class="badge bg-success">Deposit</span>
             {% elif t.kind in ('withdrawal','cash_out') %}<span class="badge bg-danger">Withdrawal</span>
-            {% else %}<span class="badge bg-primary">Transfer</span>{% endif %}
+            {% elif t.kind == 'dealer_buy' %}<span class="badge bg-success">Dealer Buy AUD</span>
+            {% elif t.kind == 'dealer_sell' %}<span class="badge bg-warning text-dark">Dealer Sell AUD</span>
+            {% elif t.kind == 'dealer_payout' %}<span class="badge bg-info text-dark">Dealer Payout</span>
+            {% elif t.kind in ('transfer','internal_transfer') %}<span class="badge bg-primary">Transfer</span>
+            {% else %}<span class="badge bg-secondary">{{ t.kind }}</span>{% endif %}
           </td>
-          <td class="money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind in ('deposit','cash_in') else ('text-danger' if t.kind in ('withdrawal','cash_out') else '')) }}">{% if t.kind in ('deposit','cash_in') %}+{% elif t.kind in ('withdrawal','cash_out') %}−{% endif %}{{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and can('edit_transaction') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<div class="d-flex justify-content-center gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
+          <td class="money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind in ('deposit','cash_in','dealer_buy') else ('text-danger' if t.kind in ('withdrawal','cash_out','dealer_sell','dealer_payout') else '')) }}">{% if t.kind in ('deposit','cash_in','dealer_buy') %}+{% elif t.kind in ('withdrawal','cash_out','dealer_sell','dealer_payout') %}−{% endif %}{{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and can('edit_transaction') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<div class="d-flex justify-content-center gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
         </tr>
       {% else %}
         <tr><td colspan="4" class="text-center text-muted py-4">No matching transactions</td></tr>

@@ -816,7 +816,7 @@ def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, cu
             delta=-aud if kind=='dealer_sell' else aud
             if delta<0 and ledger_balance(bank_id)<aud: raise ValueError('Insufficient bank balance')
         # dealer payout counts as customer withdrawal, without any bank Entry
-        t=Transaction(platform_id=platform_id,reference=reference,signed_amount=(-aud if kind!='dealer_buy' else aud),
+        t=Transaction(platform_id=platform_id,kind=kind,reference=reference,signed_amount=(-aud if kind!='dealer_buy' else aud),
                       customer_ref=customer_ref.strip() or None,remark=remark.strip()[:2000],created_by=user_id,business_date=day)
         db.session.add(t);db.session.flush()
         if bank_id: db.session.add(Entry(transaction_id=t.id,bank_id=bank_id,delta=delta))

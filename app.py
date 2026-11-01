@@ -11,8 +11,8 @@ from sqlalchemy import func, select, UniqueConstraint, Index, or_, and_, case, t
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet, InvalidToken
-from closing_engine import next_boundary, as_utc, effective_timezone
-from period_reporting import utc_bank_overview, utc_ledger
+from closing_engine import next_boundary, as_utc, effective_timezone, period_business_day
+from period_reporting import utc_bank_overview, utc_ledger, day_bank_overview
 from financial_integrity import verify_period
 
 # Legacy name kept to limit the diff: this is the business display timezone, now Melbourne by default.
@@ -506,6 +506,20 @@ def pending_unclaim_at_utc(bank_id, end_utc):
         .where(UnclaimAllocation.bank_id==bank_id,UnclaimAllocation.created_at<end_utc)).scalar()
     return money(credited)-money(assigned)
 
+def pending_unclaim_through_day(bank_id, day, event_end_utc):
+    """Pending Unclaim as of the end of business day `day`.
+
+    Posted Unclaim credits follow their business_date (like every other ledger entry);
+    allocations are real-time events, so they count when created before event_end_utc.
+    """
+    credited=db.session.execute(select(func.coalesce(func.sum(Entry.delta),0))
+        .join(Transaction,Entry.transaction_id==Transaction.id)
+        .where(Entry.bank_id==bank_id,Transaction.kind=='unclaim',
+               Transaction.status=='confirmed',Transaction.business_date<=day)).scalar()
+    assigned=db.session.execute(select(func.coalesce(func.sum(UnclaimAllocation.amount),0))
+        .where(UnclaimAllocation.bank_id==bank_id,UnclaimAllocation.created_at<event_end_utc)).scalar()
+    return money(credited)-money(assigned)
+
 def operating_balance_at_utc(bank_id,end_utc):
     return ledger_balance_at_utc(bank_id,end_utc)-pending_unclaim_at_utc(bank_id,end_utc)
 
@@ -916,7 +930,10 @@ def create_app(test_config=None):
                 db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('manage_timezone'))
         history=BusinessTimezoneChange.query.order_by(BusinessTimezoneChange.effective_at.desc()).limit(30).all()
-        return render_template('timezone_settings.html',offset_minutes=policy.manual_offset_minutes,history=history,policy=policy)
+        eff_now=now().astimezone(effective_timezone(policy.auto_timezone,policy.manual_offset_minutes))
+        off_min=int(eff_now.utcoffset().total_seconds()//60)
+        live_label=f"{eff_now.tzname() if policy.auto_timezone else 'Manual'} GMT{'+' if off_min>=0 else '-'}{abs(off_min)//60:02d}:{abs(off_min)%60:02d}"
+        return render_template('timezone_settings.html',offset_minutes=policy.manual_offset_minutes,history=history,policy=policy,live_label=live_label)
 
     @app.get('/admin/clear-platform')
     @role_required('admin')
@@ -1213,8 +1230,8 @@ def create_app(test_config=None):
         day_end = range_end_utc
         existing = [b for b in all_banks if b.created_at is None or _utc_db(b.created_at) < day_end]
         statuses = {b.id: (b.status if day == business_today() else bank_status_on(b, day, history_by_bank)) for b in existing}
-        period_stats = (utc_bank_overview(db, Bank, Entry, Transaction, existing, range_start_utc, range_end_utc)
-                        if range_end_utc > range_start_utc else {})
+        # Amounts follow business_date so the dashboard equals the closing figures.
+        period_stats = day_bank_overview(db, Bank, Entry, Transaction, existing, start_day, day) if existing else {}
         if not period_stats:
             period_stats = {b.id: dict(opening=money(b.opening_balance),in_amount=Decimal('0'),out_amount=Decimal('0'),in_count=0,out_count=0,day_close=money(b.opening_balance)) for b in existing}
         # Use immutable snapshots only for a matching single completed period.
@@ -1238,22 +1255,22 @@ def create_app(test_config=None):
         # The ledger entry remains a genuine credit; presentation reclassifies
         # that credit rather than posting it a second time.
         posted_unclaim = {b.id: Decimal('0.00') for b in existing}
-        if existing and range_end_utc > range_start_utc:
+        if existing:
             unclaim_rows = db.session.execute(
                 select(Entry.bank_id, func.coalesce(func.sum(Entry.delta), 0), func.count(Entry.id))
                 .join(Transaction, Entry.transaction_id == Transaction.id)
                 .where(Entry.bank_id.in_([b.id for b in existing]),
                        Transaction.kind == 'unclaim', Transaction.status == 'confirmed',
-                       Transaction.created_at >= range_start_utc,
-                       Transaction.created_at < range_end_utc)
+                       Transaction.business_date >= start_day,
+                       Transaction.business_date <= day)
                 .group_by(Entry.bank_id)).all()
             for bank_id, amount, count in unclaim_rows:
                 posted_unclaim[bank_id] = money(amount)
                 period_stats[bank_id]['in_amount'] = money(period_stats[bank_id]['in_amount']) - money(amount)
                 period_stats[bank_id]['in_count'] = max(0, int(period_stats[bank_id]['in_count']) - int(count))
         # Operating opening excludes cumulative unallocated Unclaim from prior days.
-        pending_open={b.id:pending_unclaim_at_utc(b.id,range_start_utc) for b in existing}
-        pending_close={b.id:pending_unclaim_at_utc(b.id,range_end_utc) for b in existing}
+        pending_open={b.id:pending_unclaim_through_day(b.id,start_day-timedelta(days=1),range_start_utc) for b in existing}
+        pending_close={b.id:pending_unclaim_through_day(b.id,day,range_end_utc) for b in existing}
         for bank in existing:
             stats=period_stats[bank.id]
             stats['opening']=money(stats['opening'])-pending_open[bank.id]
@@ -1322,7 +1339,7 @@ def create_app(test_config=None):
         bank_items = filtered_active_banks[(bank_page-1)*10:bank_page*10]
         rows = db.session.execute(
             select(Transaction.kind, func.count(Transaction.id), func.coalesce(func.sum(Transaction.signed_amount), 0))
-            .where(Transaction.created_at >= range_start_utc, Transaction.created_at < range_end_utc, Transaction.status == 'confirmed',platform_scope(Transaction))
+            .where(Transaction.business_date >= start_day, Transaction.business_date <= day, Transaction.status == 'confirmed',platform_scope(Transaction))
             .group_by(Transaction.kind)).all()
         totals = {k: {'count': n, 'amount': money(v)} for k, n, v in rows}
         # Allocations count as Customer Deposits on the allocation date, without a bank entry.
@@ -1334,8 +1351,8 @@ def create_app(test_config=None):
             deposit_total['amount']+=allocation_amount
 
         # Dashboard retains its historical report-date filtering (V7.9.6.11 behavior).
-        latest = (Transaction.query.filter(Transaction.created_at >= range_start_utc,
-                                           Transaction.created_at < range_end_utc, platform_scope(Transaction))
+        latest = (Transaction.query.filter(Transaction.business_date >= start_day,
+                                           Transaction.business_date <= day, platform_scope(Transaction))
                   .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
         platform_names = {p.id:p.name for p in Platform.query.filter(Platform.id.in_({t.platform_id for t in latest})).all()} if latest else {}
         void_audits = (TransactionAudit.query.filter(TransactionAudit.transaction_id.in_([t.id for t in latest]),TransactionAudit.action=='VOID').order_by(TransactionAudit.created_at.desc()).all() if latest else [])
@@ -1375,21 +1392,22 @@ def create_app(test_config=None):
         normalized_id = func.lower(func.trim(Transaction.customer_ref))
         active_ids = set(db.session.execute(
             select(normalized_id).where(*activity_filter,
-                Transaction.created_at >= range_start_utc, Transaction.created_at < range_end_utc).distinct()
+                Transaction.business_date >= start_day, Transaction.business_date <= day).distinct()
         ).scalars().all())
         first_seen = db.session.execute(
-            select(normalized_id, func.min(Transaction.created_at))
+            select(normalized_id, func.min(Transaction.business_date))
             .where(*activity_filter).group_by(normalized_id)
         ).all()
         first_dates = dict(first_seen)
+        def _as_day(v): return date.fromisoformat(str(v)[:10]) if isinstance(v,str) else (v.date() if isinstance(v,datetime) else v)
         new_count = sum(1 for customer_id in active_ids
-                        if range_start_utc <= first_dates[customer_id].replace(tzinfo=first_dates[customer_id].tzinfo or timezone.utc) < range_end_utc)
+                        if start_day <= _as_day(first_dates[customer_id]) <= day)
         dealer_items = Dealer.query.filter(platform_scope(Dealer)).order_by(Dealer.name).all()
         dealer_rows = db.session.execute(
             select(DealerTrade.dealer_id, DealerTrade.flow,
                    func.sum(DealerTrade.aud_amount), func.sum(DealerTrade.myr_delta))
             .join(Transaction, Transaction.id == DealerTrade.transaction_id)
-            .where(Transaction.status == 'confirmed',Transaction.created_at >= range_start_utc, Transaction.created_at < range_end_utc,platform_scope(Transaction))
+            .where(Transaction.status == 'confirmed',Transaction.business_date >= start_day, Transaction.business_date <= day,platform_scope(Transaction))
             .group_by(DealerTrade.dealer_id, DealerTrade.flow)
         ).all()
         dealer_totals = {}
@@ -2376,23 +2394,29 @@ def create_app(test_config=None):
                 bs=lock_banks([bank_id]);
                 if len(bs)!=1: raise ValueError('Bank not found')
                 if bs[0].status=='closed': raise ValueError('Closed banks cannot be reconciled or rolled into the next opening')
-                if Closing.query.filter_by(bank_id=bank_id,business_date=today).first(): raise ValueError('Already closed today')
                 previous=_closing_anchor(bank_id)
                 if previous is None:
                     raise ValueError('Closing is blocked: Admin must initialize a verified UTC boundary for this bank first')
                 start=_utc_db(previous.end_utc)
                 policy=db.session.get(ClosingPolicy,1)
                 if policy is None: raise ValueError('Configure Business Timezone closing policy first')
+                # Closing amounts follow business_date (Melbourne calendar day), which is only
+                # coherent when the business day is Melbourne 00:00-00:00 with automatic DST.
+                if not policy.auto_timezone or policy.closing_hour!=0 or policy.closing_minute!=0:
+                    raise ValueError('Closing requires Auto Timezone (Australia/Melbourne) and a 00:00 closing time')
                 end=next_boundary(start,policy.closing_hour,policy.closing_minute,policy.auto_timezone,policy.manual_offset_minutes)
                 if end>now(): raise ValueError('Scheduled closing time has not arrived yet')
+                # The period ending at Melbourne 00:00 on 2 Nov closes the books of 1 Nov.
+                period_day=period_business_day(end,policy.auto_timezone,policy.manual_offset_minutes)
+                if Closing.query.filter_by(bank_id=bank_id,business_date=period_day).first(): raise ValueError(f'Business date {period_day.isoformat()} is already closed for this bank')
                 # No silent skip: if the earliest due period is older than one day,
                 # require reconciliation instead of closing multiple days as one.
                 if now()-end>timedelta(hours=26):
                     raise ValueError('Closing boundary is overdue; reconcile missed periods before proceeding')
-                overview=utc_bank_overview(db,Bank,Entry,Transaction,bs,start,end)[bank_id]
-                sysbal=ledger_balance_at_utc(bank_id,end)
+                overview=day_bank_overview(db,Bank,Entry,Transaction,bs,period_day,period_day)[bank_id]
+                sysbal=ledger_balance(bank_id,through=period_day)
                 verify_period(overview['opening'],overview['in_amount'],overview['out_amount'],sysbal,start,end,previous_end=start)
-                close=Closing(bank_id=bank_id,business_date=today,system_balance=sysbal,actual_balance=actual,difference=actual-sysbal,remark=request.form.get('remark','').strip(),created_by=current_user.id)
+                close=Closing(bank_id=bank_id,business_date=period_day,system_balance=sysbal,actual_balance=actual,difference=actual-sysbal,remark=request.form.get('remark','').strip(),created_by=current_user.id)
                 db.session.add(close)
                 db.session.flush()
                 period=ClosingPeriod(bank_id=bank_id,start_utc=start,end_utc=end,status='closed',closing_id=close.id)
@@ -2413,7 +2437,7 @@ def create_app(test_config=None):
                     unclaimed_amount=sum((money(lead.amount) for lead in leads),Decimal('0')),
                     unclaimed_count=len(leads),
                     unclaimed_json=json.dumps(lead_items,sort_keys=True)))
-                pending_close=pending_unclaim_at_utc(bank_id,end)
+                pending_close=pending_unclaim_through_day(bank_id,period_day,end)
                 if pending_close<0: raise ValueError('Pending Unclaimed cannot be negative')
                 db.session.add(OperatingClosingSnapshot(closing_period_id=period.id,bank_id=bank_id,
                     actual_bank_closing=sysbal,pending_unclaimed_closing=pending_close,

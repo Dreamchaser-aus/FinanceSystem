@@ -59,3 +59,12 @@ def validate_continuity(periods):
             return False
         last_end = end
     return True
+
+def period_business_day(end_utc, auto_enabled=True, manual_offset_minutes=600):
+    """Local calendar day covered by a period that ends at end_utc.
+
+    A Melbourne 00:00 boundary on 2 Nov closes the books of 1 Nov: the last instant
+    of the period is end - 1 microsecond, whose local date is 1 Nov.
+    """
+    tz = effective_timezone(auto_enabled, manual_offset_minutes)
+    return (as_utc(end_utc).astimezone(tz) - timedelta(microseconds=1)).date()

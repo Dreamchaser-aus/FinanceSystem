@@ -22,3 +22,27 @@ def utc_bank_overview(db, Bank, Entry, Transaction, banks, start_utc, end_utc):
         outgoing=Decimal(str(r.out_amount)) if r else Decimal('0')
         result[b.id]={'opening':opening,'in_amount':incoming,'out_amount':outgoing,'in_count':int(r.in_count) if r else 0,'out_count':int(r.out_count) if r else 0,'daily':incoming-outgoing,'day_close':opening+incoming-outgoing}
     return result
+
+
+def day_bank_overview(db, Bank, Entry, Transaction, banks, start_day, end_day):
+    """Business-date aggregates for the inclusive local days [start_day, end_day].
+
+    Opening = bank opening balance + confirmed entries dated before start_day.
+    Movements = confirmed entries dated start_day..end_day. A transaction belongs to
+    the business day chosen at entry time (today or yesterday), not to the instant
+    it was created, so a back-dated entry lands in the day it was dated for.
+    """
+    if end_day < start_day: raise ValueError('Invalid business-date range')
+    ids=[b.id for b in banks]
+    if not ids: return {}
+    before=dict(db.session.execute(select(Entry.bank_id,func.coalesce(func.sum(Entry.delta),0)).join(Transaction,Entry.transaction_id==Transaction.id).where(Entry.bank_id.in_(ids),Transaction.status=='confirmed',Transaction.business_date<start_day).group_by(Entry.bank_id)).all())
+    period=db.session.execute(select(Entry.bank_id,func.coalesce(func.sum(Entry.delta),0).label('delta'),func.coalesce(func.sum(case((Entry.delta>0,Entry.delta),else_=0)),0).label('in_amount'),func.coalesce(func.sum(case((Entry.delta<0,-Entry.delta),else_=0)),0).label('out_amount'),func.coalesce(func.sum(case((Entry.delta>0,1),else_=0)),0).label('in_count'),func.coalesce(func.sum(case((Entry.delta<0,1),else_=0)),0).label('out_count')).join(Transaction,Entry.transaction_id==Transaction.id).where(Entry.bank_id.in_(ids),Transaction.status=='confirmed',Transaction.business_date>=start_day,Transaction.business_date<=end_day).group_by(Entry.bank_id)).all()
+    by_id={r.bank_id:r for r in period}
+    result={}
+    for b in banks:
+        r=by_id.get(b.id)
+        opening=Decimal(str(b.opening_balance))+Decimal(str(before.get(b.id,0)))
+        incoming=Decimal(str(r.in_amount)) if r else Decimal('0')
+        outgoing=Decimal(str(r.out_amount)) if r else Decimal('0')
+        result[b.id]={'opening':opening,'in_amount':incoming,'out_amount':outgoing,'in_count':int(r.in_count) if r else 0,'out_count':int(r.out_count) if r else 0,'daily':incoming-outgoing,'day_close':opening+incoming-outgoing}
+    return result

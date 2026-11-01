@@ -1,15 +1,24 @@
 {% extends 'base.html' %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3">
-  <div><h3 class="mb-1">New Transaction</h3><div class="text-muted">One form for customer, bank and dealer transactions</div></div>
-  <div class="d-flex gap-2">{% if can("view_bank_balances") %}<a class="btn btn-primary" href="{{url_for('workspace')}}">Active Bank Balances</a>{% endif %}{% if can("view_transactions") %}<a class="btn btn-outline-secondary" href="{{url_for('transactions')}}">History</a>{% endif %}</div>
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div><h3 class="mb-1">New Transaction</h3><div class="text-muted">Record transactions and review updated bank balances in one place</div></div>
+  <div class="d-flex flex-wrap gap-2">
+<button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#newTransactionEntryModal">+ Add Transaction</button>
+<button type="button" class="btn btn-outline-success" data-quick-kind="deposit">Deposit</button>
+<button type="button" class="btn btn-outline-danger" data-quick-kind="withdrawal">Withdraw</button>
+<button type="button" class="btn btn-outline-primary" data-quick-kind="unclaim">Unclaim</button>
+<button type="button" class="btn btn-outline-info" data-quick-kind="deposit_back">Deposit Back</button>
 </div>
-<div class="row g-3 align-items-start"><div class="col-12 {{'col-xl-7' if can('view_bank_balances') else 'col-xl-9'}}"><div class="card p-3 p-lg-4">
-  <form method="post" id="newTransactionForm">
+</div>
+<div class="modal fade" id="newTransactionEntryModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="newTransactionEntryTitle" aria-hidden="true">
+ <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable"><div class="modal-content">
+ <div class="modal-header"><h5 class="modal-title" id="newTransactionEntryTitle">Add New Transaction</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+ <div class="modal-body">
+  <form method="post" id="newTransactionForm" onsubmit="return false"><div class="alert alert-danger d-none" id="transactionEntryError" role="alert"></div>
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="row g-3">
-      <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="business_date">Transaction Date (MYT)</label><select class="form-select" id="business_date" name="business_date" required><option value="{{entry_today}}">Today — {{entry_today}}</option><option value="{{entry_yesterday}}">Yesterday — {{entry_yesterday}}</option></select><div class="form-text">Only today or yesterday. Actual creation time is always recorded separately.</div></div>
-      <div class="col-12"><label class="form-label fw-semibold" for="kind">Transaction Type</label>
+      <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="business_date">Transaction Date (Melbourne)</label><select class="form-select" id="business_date" name="business_date" required><option value="{{entry_today}}">Today — {{entry_today}}</option><option value="{{entry_yesterday}}">Yesterday — {{entry_yesterday}}</option></select><div class="form-text">Only today or yesterday. Actual creation time is always recorded separately.</div></div>
+      <div class="col-12" id="kindBlock"><label class="form-label fw-semibold" for="kind">Transaction Type</label>
         <select class="form-select" id="kind" name="kind" required>
           <option value="deposit">Customer Deposit — Bank Received</option>
           <option value="withdrawal">Customer Withdrawal — Bank Paid</option>
@@ -17,9 +26,15 @@
           <option value="dealer_sell">Sell AUD — Bank to Dealer</option>
           <option value="dealer_buy">Buy AUD — Dealer to Bank</option>
           <option value="transfer">Bank to Bank Transfer</option>
+          <option value="cash_in">Cash In — External AUD Received</option>
+          <option value="cash_out">Cash Out — External AUD Paid</option>
+          <option value="unclaim">Unclaim — Funds Returned to Bank</option>
+          <option value="deposit_back">Deposit Back — Withdrawal + Deposit (Internal)</option>
         </select>
       </div>
-      <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="reference">Transaction ID / Reference</label><input class="form-control" id="reference" name="reference" maxlength="120" required placeholder="Unique reference"></div>
+      <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="reference">Transaction ID / Reference</label><input class="form-control" id="reference" name="reference" maxlength="120" required placeholder="Enter platform transaction ID"><div class="form-text" id="referenceHelp">Customer transactions: enter the original transaction ID.</div><div class="invalid-feedback" id="referenceError" role="alert" aria-live="polite"></div></div>
+      <div class="col-12 col-md-6 d-none" id="withdrawRefBlock"><label class="form-label fw-semibold" for="withdraw_reference">Withdrawal Transaction ID</label><input class="form-control" id="withdraw_reference" name="withdraw_reference" maxlength="120"><div class="invalid-feedback" id="withdrawRefError">Duplicate Transaction ID</div></div>
+      <div class="col-12 col-md-6 d-none" id="depositRefBlock"><label class="form-label fw-semibold" for="deposit_reference">Deposit Transaction ID</label><input class="form-control" id="deposit_reference" name="deposit_reference" maxlength="120"><div class="invalid-feedback" id="depositRefError">Duplicate Transaction ID</div></div>
       <div class="col-12 col-md-6"><label class="form-label fw-semibold" for="amount">Amount (AUD)</label><input class="form-control" type="number" inputmode="decimal" id="amount" name="amount" min="0.01" step="0.01" required></div>
       <div class="col-12 col-md-6" id="bankBlock"><label class="form-label fw-semibold" id="bankLabel" for="bank_id">Receiving Bank</label><select class="form-select" id="bank_id" name="bank_id"><option value="">Select bank</option>{% for bank in banks %}<option value="{{ bank.id }}">{{ bank.name }}</option>{% endfor %}</select></div>
       <div class="col-12 col-md-6 d-none" id="toBankBlock"><label class="form-label fw-semibold" for="to_bank_id">Destination Bank</label><select class="form-select" id="to_bank_id" name="to_bank_id"><option value="">Select destination</option>{% for bank in banks %}<option value="{{ bank.id }}">{{ bank.name }}</option>{% endfor %}</select></div>
@@ -29,41 +44,154 @@
       <div class="col-12"><label class="form-label fw-semibold" for="remark">Remark (optional)</label><textarea class="form-control" id="remark" name="remark" rows="2" maxlength="2000"></textarea></div>
     </div>
     <div class="alert alert-light border mt-3 mb-3" id="impact" aria-live="polite"></div>
-    <button class="btn btn-primary" type="submit" id="submitBtn">Review &amp; Confirm Transaction</button>
     <p class="text-muted small mt-2 mb-0">Submit only after payment is confirmed. Dealer-paid customer withdrawals do not change bank balances.</p>
   </form>
-</div></div>
-{% if can('view_bank_balances') %}<div class="col-12 col-xl-5"><div class="card p-3 mb-3"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Active Bank Balances</h5><a class="btn btn-sm btn-outline-primary" href="{{url_for('new_transaction')}}">↻ Refresh</a></div><p class="small text-muted mb-2">AUD · Active banks only · confirmed ledger balances. Opening / Daily use today's MYT business date.</p><div style="max-height:370px;overflow:auto">{% set overview_banks=balance_banks %}{% include '_bank_overview.html' %}</div></div>
-{% if can('view_bank_movements') %}<div class="card p-3" id="latest-transactions"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Latest Transactions</h5>{% if recent_pagination %}<span class="small text-muted">{{recent_pagination.total}} movements</span>{% endif %}</div><form method="get" action="{{url_for('new_transaction')}}" class="d-flex gap-2 mb-2" id="movement-search-form"><select class="form-select form-select-sm" name="movement_bank" aria-label="Filter bank"><option value="">All banks</option>{% for b in balance_banks %}<option value="{{b.id}}" {{'selected' if movement_bank==b.id else ''}}>{{b.name}}</option>{% endfor %}</select><input type="search" class="form-control form-control-sm" name="movement_search" value="{{movement_search}}" placeholder="Search reference, customer or bank" aria-label="Search latest transactions"><button class="btn btn-sm btn-outline-primary" type="submit">Search</button>{% if movement_search %}<a class="btn btn-sm btn-outline-secondary" href="{{url_for('new_transaction')}}#latest-transactions">Clear</a>{% endif %}</form><div class="table-responsive" style="max-height:370px"><table class="table table-sm"><thead><tr><th>Time</th><th>Bank</th><th>Reference</th><th class="text-end">AUD</th></tr></thead><tbody>{% for e,t,name in recent %}<tr class="{{'table-danger' if t.status=='voided' else ''}}"><td class="small">{{t.created_at|mytime}}</td><td>{{name}}</td><td>{{t.reference}}{% if t.status=='voided' %}<span class="badge bg-danger ms-1">DELETED</span>{% endif %}</td><td class="text-end money {{'text-danger text-decoration-line-through' if t.status=='voided' else ('text-success' if e.delta>=0 else 'text-danger')}}">{{'+' if e.delta>=0 else ''}}{{e.delta|rm}}</td></tr>{% else %}<tr><td colspan="4">No recent movements</td></tr>{% endfor %}</tbody></table></div>{% if recent_pagination and recent_pagination.pages > 1 %}<nav aria-label="Latest transactions pages" class="d-flex justify-content-between align-items-center flex-wrap gap-2 mt-3"><span class="small text-muted">Page {{recent_pagination.page}} of {{recent_pagination.pages}}</span><div class="btn-group btn-group-sm"><a class="btn btn-outline-primary {{'disabled' if not recent_pagination.has_prev else ''}}" {% if recent_pagination.has_prev %}href="{{url_for('new_transaction',recent_page=recent_pagination.page-1,movement_search=movement_search,movement_bank=movement_bank)}}#latest-transactions"{% else %}aria-disabled="true" tabindex="-1"{% endif %}>Previous</a><a class="btn btn-outline-primary {{'disabled' if not recent_pagination.has_next else ''}}" {% if recent_pagination.has_next %}href="{{url_for('new_transaction',recent_page=recent_pagination.page+1,movement_search=movement_search,movement_bank=movement_bank)}}#latest-transactions"{% else %}aria-disabled="true" tabindex="-1"{% endif %}>Next</a></div></nav>{% endif %}</div>{% endif %}</div>{% endif %}</div>
-
-<div class="modal fade" id="transactionConfirmModal" tabindex="-1" aria-labelledby="transactionConfirmTitle" aria-hidden="true">
-  <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
-    <div class="modal-header"><h5 class="modal-title" id="transactionConfirmTitle">Confirm New Transaction</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-    <div class="modal-body"><p class="text-muted small">Please check every detail before posting. The transaction will be saved only after you confirm.</p><dl class="row mb-0" id="transactionConfirmDetails"></dl></div>
-    <div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Back to Edit</button><button type="button" class="btn btn-primary" id="confirmPostBtn">Confirm &amp; Post</button></div>
-  </div></div>
+ </div><div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary" type="submit" form="newTransactionForm" id="submitBtn">Review &amp; Confirm Transaction</button></div>
+ </div></div>
 </div>
+<div class="row g-3"><div class="col-12">
+{% if can('view_bank_balances') %}<div class="card p-3 mb-3" id="newtx-bank-balances"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Active Bank Balances</h5><a class="btn btn-sm btn-outline-primary" href="{{url_for('new_transaction')}}">↻ Refresh</a></div><div class="d-flex flex-wrap gap-2 mb-2" id="newtx-bank-tabs" role="group" aria-label="Bank balance filters">
+{% for value,label in [('active','Active Banks'),('group:deposit','Deposit Bank'),('group:withdrawal','Withdraw Bank'),('group:store','Store'),('problem','Problem Bank'),('all','All Banks')] %}
+<button type="button" class="btn btn-sm {{'btn-primary' if value=='active' else 'btn-outline-primary'}}" data-newtx-bank-tab="{{value}}" aria-pressed="{{'true' if value=='active' else 'false'}}">{{label}}</button>
+{% endfor %}
+</div>
+<p class="small text-muted mb-2">AUD · Confirmed ledger balances · Opening / Daily use today's Melbourne business date. Problem Bank excludes Active and Block (Closed).</p><div style="max-height:370px;overflow:auto">{% set overview_banks=balance_banks %}{% set overview_enable_status_edit=true %}{% set overview_enable_details_modal=true %}{% include '_bank_overview.html' %}</div></div>
+{% if can('view_bank_details') %}
+{% for b in balance_banks %}
+{% set d=bank_details_map.get(b.id) %}
+{% set v=bank_stats[b.id] %}
+<div class="modal fade" id="newtx-bank-details-modal-{{b.id}}" tabindex="-1" aria-labelledby="newtx-bank-details-title-{{b.id}}" aria-hidden="true">
+ <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable"><div class="modal-content">
+  <div class="modal-header"><h5 class="modal-title" id="newtx-bank-details-title-{{b.id}}">Bank Details · {{b.name}}</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+  <div class="modal-body">
+   <h6>Bank Overview</h6>
+   <dl class="row mb-3">
+    <dt class="col-sm-4">Bank Name</dt><dd class="col-sm-8">{{b.name}}</dd>
+    <dt class="col-sm-4">Group</dt><dd class="col-sm-8">{{b.kind|title}}</dd>
+    <dt class="col-sm-4">Status</dt><dd class="col-sm-8">{{bank_status_options.get(b.status,b.status)}}{% if not b.active %} · Inactive{% endif %}</dd>
+    <dt class="col-sm-4">Status Remark</dt><dd class="col-sm-8 text-break">{{b.status_remark or '—'}}</dd>
+    <dt class="col-sm-4">Opening</dt><dd class="col-sm-8">AUD {{v.opening|rm}}</dd>
+    <dt class="col-sm-4">Daily</dt><dd class="col-sm-8">AUD {{v.daily|rm}}</dd>
+    <dt class="col-sm-4">Current Balance</dt><dd class="col-sm-8 fw-semibold">AUD {{v.current|rm}}</dd>
+    <dt class="col-sm-4">IN / OUT</dt><dd class="col-sm-8">{{v.in_count}} ({{v.in_amount|rm}}) / {{v.out_count}} ({{v.out_amount|rm}})</dd>
+    <dt class="col-sm-4">Created At</dt><dd class="col-sm-8">{{b.created_at|mytime if b.created_at else '—'}}</dd>
+    <dt class="col-sm-4">Status Updated</dt><dd class="col-sm-8">{{b.status_updated_at|mytime if b.status_updated_at else '—'}}</dd>
+   </dl>
+   <h6>Account Information</h6>
+   <dl class="row mb-0">
+   {% for label,value in [('PayID',d.payid if d else None),('BSB Number',d.bsb_number if d else None),('Account Number',d.account_number if d else None),('Phone Number',d.phone_number if d else None),('Date of Birth',d.date_of_birth if d else None),('Card Last 4',d.card_details[-4:] if d and d.card_details else None),('Expiry Date',d.expiry_date if d else None),('OTP API Link',d.otp_api_link if d else None),('Remark',d.remark if d else None)] %}
+    <dt class="col-sm-4">{{label}}</dt><dd class="col-sm-8 text-break">{{value or '—'}}</dd>
+   {% endfor %}
+   <dt class="col-sm-4">Login ID</dt><dd class="col-sm-8">
+   {% if can('view_sensitive_bank_details') %}
+   <div class="d-flex flex-wrap gap-2 align-items-center"><input class="form-control form-control-sm" style="max-width:290px" type="text" readonly autocomplete="off" aria-label="Bank login ID" id="newtx-login-id-{{b.id}}" value="{{d.login_id if d and d.login_id else ''}}"><button type="button" class="btn btn-sm btn-outline-primary newtx-copy-field" data-target="newtx-login-id-{{b.id}}" {{'disabled' if not d or not d.login_id else ''}}>Copy</button></div>
+   {% else %}<span class="text-muted">Restricted · insufficient permission</span>{% endif %}
+   </dd>
+   <dt class="col-sm-4">Login Password</dt><dd class="col-sm-8">
+   {% if can('view_sensitive_bank_details') %}
+   <div class="d-flex flex-wrap gap-2 align-items-center"><input class="form-control form-control-sm" style="max-width:290px" type="password" readonly autocomplete="off" aria-label="Bank login password" id="newtx-password-{{b.id}}" placeholder="Click Reveal to view"><button type="button" class="btn btn-sm btn-outline-warning newtx-reveal-password" data-url="{{url_for('reveal_bank_password',bank_id=b.id)}}" data-target="newtx-password-{{b.id}}">Reveal Password</button><button type="button" class="btn btn-sm btn-outline-secondary newtx-toggle-password" data-target="newtx-password-{{b.id}}" hidden>Hide</button><button type="button" class="btn btn-sm btn-outline-primary newtx-copy-field" data-target="newtx-password-{{b.id}}" disabled>Copy</button></div>
+   <small class="text-muted">Password access is audited. Do not share credentials.</small>
+   {% else %}<span class="text-muted">Restricted · insufficient permission</span>{% endif %}
+   </dd>
+   </dl>
+  </div>
+  <div class="modal-footer">{% if can('view_bank_details') %}<a href="{{url_for('bank_details',bank_id=b.id)}}" class="btn btn-outline-primary">Open Bank Details</a>{% endif %}<button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+ </div></div>
+</div>
+{% endfor %}
+{% endif %}
+{% if current_user.role in ('admin','staff') and can('view_bank_balances') %}
+{% for b in balance_banks %}
+<div class="modal fade" id="newtx-bank-status-modal-{{b.id}}" tabindex="-1" aria-labelledby="newtx-bank-status-title-{{b.id}}" aria-hidden="true">
+ <div class="modal-dialog modal-dialog-centered modal-sm"><div class="modal-content">
+  <form method="post" action="{{url_for('update_bank_status',bank_id=b.id)}}">
+   <input type="hidden" name="csrf_token" value="{{csrf_token()}}">
+   <input type="hidden" name="return_to" value="new_transaction">
+   <div class="modal-header"><h6 class="modal-title" id="newtx-bank-status-title-{{b.id}}">Update Bank Status</h6><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+   <div class="modal-body">
+    <div class="small fw-semibold mb-2">{{b.name}}</div>
+    <label class="form-label small" for="newtx-status-select-{{b.id}}">Current status</label>
+    <select id="newtx-status-select-{{b.id}}" name="status" class="form-select form-select-sm mb-3" required>{% for value,label in bank_status_options.items() %}<option value="{{value}}" {% if value==b.status %}selected{% endif %}>{{label}}</option>{% endfor %}</select>
+    <label class="form-label small" for="newtx-status-reason-{{b.id}}">Reason (required for any non-Active status)</label>
+    <textarea id="newtx-status-reason-{{b.id}}" name="remark" maxlength="2000" rows="3" class="form-control form-control-sm" placeholder="Describe the issue">{{b.status_remark or ''}}</textarea>
+   </div>
+   <div class="modal-footer"><button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-sm btn-primary">Save Changes</button></div>
+  </form>
+ </div></div>
+</div>
+{% endfor %}
+{% endif %}
+{% if can('view_bank_movements') %}<div class="card p-3" id="latest-transactions"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Latest Transactions — Today (Latest 20)</h5>{% if can('view_transactions') %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('transactions',all_dates=1)}}">View All</a>{% endif %}</div><form method="get" action="{{url_for('new_transaction')}}" class="d-flex gap-2 mb-2" id="movement-search-form"><select class="form-select form-select-sm" name="movement_bank" aria-label="Filter bank"><option value="">All banks</option>{% for b in balance_banks %}<option value="{{b.id}}" {{'selected' if movement_bank==b.id else ''}}>{{b.name}}</option>{% endfor %}</select><input type="search" class="form-control form-control-sm" name="movement_search" value="{{movement_search}}" placeholder="Search reference, customer or bank" aria-label="Search latest transactions"><button class="btn btn-sm btn-outline-primary" type="submit">Search</button>{% if movement_search %}<a class="btn btn-sm btn-outline-secondary" href="{{url_for('new_transaction')}}#latest-transactions">Clear</a>{% endif %}</form><div class="table-responsive" style="max-height:370px"><table class="table table-sm"><thead><tr><th>Time</th><th>Bank</th><th>Reference</th><th>Type</th><th class="text-end">AUD</th><th>Action</th></tr></thead><tbody>{% for e,t,name in recent %}<tr class="{{'table-danger' if t.status=='voided' else ''}}"><td class="small">{{t.created_at|mytime}}</td><td>{{name}}</td><td>{{t.reference}}{% if t.status=='voided' %}<span class="badge bg-danger ms-1">DELETED</span>{% endif %}</td><td><span class="badge {{'bg-success' if t.kind=='deposit' else 'bg-warning text-dark' if t.kind in ('withdrawal','dealer_payout') else 'bg-secondary'}}">{{'Deposit' if t.kind=='deposit' else 'Withdrawal' if t.kind in ('withdrawal','dealer_payout') else t.kind|replace('_',' ')|title}}</span></td><td class="text-end money {{'text-danger text-decoration-line-through' if t.status=='voided' else ('text-success' if e.delta>=0 else 'text-danger')}}">{{'+' if e.delta>=0 else ''}}{{e.delta|rm}}</td><td>{% if t.status=='confirmed' and current_user.role in ('admin','staff') and t.business_date.isoformat()==entry_today and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') and not (t.remark or '').startswith('[DEPOSIT_BACK:') %}<button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#newtx-delete-{{t.id}}">Delete</button>{% elif t.status=='voided' %}<span class="badge bg-danger">Deleted</span>{% else %}<span class="text-muted">—</span>{% endif %}</td></tr>{% else %}<tr><td colspan="6">No recent movements</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}{% endif %}</div></div>
+
+
+{% for e,t,name in recent %}
+{% if t.status=='confirmed' and current_user.role in ('admin','staff') and t.business_date.isoformat()==entry_today and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') and not (t.remark or '').startswith('[DEPOSIT_BACK:') %}
+<div class="modal fade" id="newtx-delete-{{t.id}}" tabindex="-1" aria-labelledby="newtx-delete-title-{{t.id}}" aria-hidden="true">
+ <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+  <form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}">
+   <input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input type="hidden" name="return_to" value="new_transaction">
+   <div class="modal-header"><h5 class="modal-title" id="newtx-delete-title-{{t.id}}">Delete Transaction</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+   <div class="modal-body"><dl class="row small mb-3"><dt class="col-4">Bank</dt><dd class="col-8">{{name}}</dd><dt class="col-4">Transaction ID</dt><dd class="col-8 text-break">{{t.reference}}</dd><dt class="col-4">Type</dt><dd class="col-8">{{t.kind|replace('_',' ')|title}}</dd><dt class="col-4">Amount</dt><dd class="col-8">AUD {{t.signed_amount|abs|rm}}</dd></dl>
+    <label class="form-label fw-semibold" for="newtx-delete-reason-{{t.id}}">Delete Remark <span class="text-danger">*</span></label><textarea id="newtx-delete-reason-{{t.id}}" class="form-control" name="reason" rows="3" minlength="5" maxlength="500" required placeholder="Minimum 5 characters"></textarea><div class="form-text">Soft delete with audit trail. Closed transactions cannot be deleted.</div>
+   </div><div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-danger">Confirm Delete</button></div>
+  </form>
+ </div></div>
+</div>
+{% endif %}
+{% endfor %}
+
 <script>
-(function () {
+// Install the no-navigation guard before the transaction UI controller.
+(function(){
+  const form=document.getElementById('newTransactionForm');
+  if(form)form.addEventListener('submit',function(e){e.preventDefault();});
+})();
+document.addEventListener('DOMContentLoaded', function () {
   const get = id => document.getElementById(id);
   const kind=get('kind'), amount=get('amount'), rate=get('rate'), bank=get('bank_id'), toBank=get('to_bank_id'), dealer=get('dealer_id'), customer=get('customer_ref');
   const dealerKinds=['dealer_sell','dealer_buy','dealer_payout'];
+  const reference=get('reference');
+  const needsCustomerReference=k=>['deposit','withdrawal','dealer_payout'].includes(k);
+  const isBack=()=>kind.value==='deposit_back';
+  function updateReference(){
+    const manual=needsCustomerReference(kind.value);
+    reference.readOnly=!manual;
+    reference.required=manual;
+    reference.value='';
+    reference.placeholder=manual?'Enter platform transaction ID':'Automatically assigned after confirmation';
+    get('reference').closest('.col-12').classList.toggle('d-none',isBack());
+    get('withdrawRefBlock').classList.toggle('d-none',!isBack());
+    get('depositRefBlock').classList.toggle('d-none',!isBack());
+    get('withdraw_reference').required=isBack();
+    get('deposit_reference').required=isBack();
+    get('referenceHelp').textContent=manual
+      ? 'Required: enter the unique transaction ID from your platform.'
+      : 'BankFlow automatically generates a unique transaction ID when saved. It cannot be edited.';
+  }
+  function clearReferenceError(){reference.classList.remove('is-invalid');get('referenceError').textContent='';}
+  reference.addEventListener('input',clearReferenceError);
+  kind.addEventListener('change',function(){clearReferenceError();updateReference();});
   const money = n => Number.isFinite(n) ? n.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2}) : '0.00';
   function refresh() {
-    const k=kind.value, isDealer=dealerKinds.includes(k), direct=k==='dealer_payout', transfer=k==='transfer';
-    get('bankBlock').classList.toggle('d-none',direct);
+    const k=kind.value, isDealer=dealerKinds.includes(k), direct=k==='dealer_payout', transfer=['transfer','internal_transfer'].includes(k);
+    const quickMode=get('newTransactionEntryModal').dataset.quickMode||'all';
+    const showKind=quickMode==='all'||quickMode==='withdrawal';
+    get('kindBlock').classList.toggle('d-none',!showKind);
+    // Deposit Back is internal; it must never select or require a real bank.
+    get('bankBlock').classList.toggle('d-none',direct||k==='deposit_back');
     get('toBankBlock').classList.toggle('d-none',!transfer);
     get('dealerBlock').classList.toggle('d-none',!isDealer);
     get('rateBlock').classList.toggle('d-none',!isDealer);
-    get('customerBlock').classList.toggle('d-none',!['deposit','withdrawal','dealer_payout'].includes(k));
-    get('bankLabel').textContent=['deposit','dealer_buy'].includes(k)?'Receiving Bank':'Source Bank';
-    bank.required=!direct; toBank.required=transfer; dealer.required=isDealer; rate.required=isDealer; customer.required=direct;
-    if(direct) bank.value='';
+    get('customerBlock').classList.toggle('d-none',!['deposit','withdrawal','dealer_payout','deposit_back'].includes(k));
+    get('bankLabel').textContent=['deposit','dealer_buy','cash_in','unclaim'].includes(k)?'Receiving Bank':'Source Bank';
+    bank.required=!direct&&k!=='deposit_back'; toBank.required=transfer; dealer.required=isDealer; rate.required=isDealer; customer.required=direct;
+    if(direct||k==='deposit_back') bank.value='';
     if(!transfer) toBank.value='';
     const aud=Number(amount.value)||0, fx=Number(rate.value)||0;
     let bankImpact='No bank movement';
-    if(k==='deposit'||k==='dealer_buy') bankImpact='Bank +AUD '+money(aud);
-    else if(k==='withdrawal'||k==='dealer_sell') bankImpact='Bank −AUD '+money(aud);
+    if(['deposit','dealer_buy','cash_in','unclaim'].includes(k)) bankImpact='Bank +AUD '+money(aud);
+    else if(k==='deposit_back') bankImpact='Internal Withdrawal −AUD '+money(aud)+' + Internal Deposit +AUD '+money(aud)+'; no bank movement (both counted in reports)';
+    else if(['withdrawal','dealer_sell','cash_out'].includes(k)) bankImpact='Bank −AUD '+money(aud);
     else if(transfer) bankImpact='Source −AUD '+money(aud)+'; destination +AUD '+money(aud);
     let msg='<strong>Impact Preview</strong><div>'+bankImpact+'</div>';
     if(isDealer) msg+='<div>Dealer '+(k==='dealer_sell'?'MYR receivable':'MYR payable')+': RM '+money(aud*fx)+'</div>';
@@ -72,45 +200,202 @@
   }
   [kind,amount,rate].forEach(el=>el.addEventListener('input',refresh));
   const form=get('newTransactionForm');
-  const confirmModal=new bootstrap.Modal(get('transactionConfirmModal'));
   let posting=false;
-  function selectedText(el){return el && el.selectedIndex>=0 ? el.options[el.selectedIndex].text : '—';}
-  function showReview(){
-    const fields=[
-      ['Transaction Date',selectedText(get('business_date'))],
-      ['Transaction Type',selectedText(kind)],
-      ['Reference',get('reference').value.trim()],
-      ['Amount (AUD)',money(Number(amount.value))],
-      ['Bank',kind.value==='dealer_payout'?'Not applicable':selectedText(bank)],
-      ['Destination Bank',kind.value==='transfer'?selectedText(toBank):null],
-      ['Dealer',dealerKinds.includes(kind.value)?selectedText(dealer):null],
-      ['Exchange Rate',dealerKinds.includes(kind.value)?get('rate').value:null],
-      ['Customer ID',['deposit','withdrawal','dealer_payout'].includes(kind.value)?customer.value.trim()||'—':null],
-      ['Remark',get('remark').value.trim()||'—']
-    ];
-    const dl=get('transactionConfirmDetails');dl.replaceChildren();
-    for(const [label,value] of fields){if(value===null)continue;
-      const dt=document.createElement('dt');dt.className='col-5 small';dt.textContent=label;
-      const dd=document.createElement('dd');dd.className='col-7 text-break';dd.textContent=value;
-      dl.append(dt,dd);
-    }
-  }
-  form.addEventListener('submit',function(e){
-    if(posting)return;
+  // One-step posting: review validates the reference and immediately posts.
+  let checkingReference=false;
+  form.addEventListener('submit',async function(e){
     e.preventDefault();
+    if(posting||checkingReference)return;
+    clearReferenceError();
     if(!form.reportValidity())return;
-    if(kind.value==='transfer'&&bank.value===toBank.value){alert('Choose two different bank accounts');return;}
-    showReview();confirmModal.show();
-  });
-  get('confirmPostBtn').addEventListener('click',function(){
-    if(posting)return;
-    if(!form.reportValidity()) {confirmModal.hide();return;}
-    if(kind.value==='transfer'&&bank.value===toBank.value){confirmModal.hide();alert('Choose two different bank accounts');return;}
+    if(['transfer','internal_transfer'].includes(kind.value)&&bank.value===toBank.value){alert('Choose two different bank accounts');return;}
+    if(isBack()){
+      const wr=get('withdraw_reference'),dr=get('deposit_reference');
+      [wr,dr].forEach(el=>el.classList.remove('is-invalid'));
+      if(wr.value.trim()===dr.value.trim()){dr.classList.add('is-invalid');get('depositRefError').textContent='Transaction IDs must be different';dr.focus();return;}
+      for(const el of [wr,dr]){
+        checkingReference=true;
+        try{
+          const body=new FormData();body.set('csrf_token',form.querySelector('[name="csrf_token"]').value);body.set('kind','deposit');body.set('reference',el.value.trim());
+          const response=await fetch({{ url_for('check_transaction_reference')|tojson }},{method:'POST',body,headers:{'Accept':'application/json'},credentials:'same-origin'});
+          const result=await response.json();
+          if(result.duplicate){el.classList.add('is-invalid');get(el.id==='withdraw_reference'?'withdrawRefError':'depositRefError').textContent='Duplicate Transaction ID';el.focus();return;}
+          if(!response.ok||!result.ok)throw new Error(result.error||'Unable to check Transaction ID');
+        }catch(err){get('transactionEntryError').textContent=err.message;get('transactionEntryError').classList.remove('d-none');return;}
+        finally{checkingReference=false;}
+      }
+    }
+    if(needsCustomerReference(kind.value)){
+      checkingReference=true;
+      const reviewButton=get('submitBtn');
+      reviewButton.disabled=true;
+      const oldLabel=reviewButton.textContent;
+      reviewButton.textContent='Checking Transaction ID...';
+      const checkedValue=reference.value.trim();
+      const checkedKind=kind.value;
+      try{
+        const body=new FormData();
+        body.set('csrf_token',form.querySelector('[name="csrf_token"]').value);
+        body.set('kind',checkedKind);
+        body.set('reference',checkedValue);
+        const response=await fetch({{ url_for('check_transaction_reference')|tojson }},{method:'POST',body,headers:{'Accept':'application/json'},credentials:'same-origin'});
+        const result=await response.json();
+        if(reference.value.trim()!==checkedValue||kind.value!==checkedKind)return;
+        if(result.duplicate){
+          reference.classList.add('is-invalid');
+          get('referenceError').textContent='Duplicate Transaction ID';
+          reference.focus();
+          return;
+        }
+        if(!response.ok||!result.ok)throw new Error(result.error||'Unable to validate Transaction ID. Please try again.');
+      }catch(err){
+        get('transactionEntryError').textContent=err.message||'Unable to validate Transaction ID. Please try again.';
+        get('transactionEntryError').classList.remove('d-none');
+        return;
+      }finally{
+        checkingReference=false;
+        reviewButton.disabled=false;
+        reviewButton.textContent=oldLabel;
+      }
+    }
+    // Keep the entry modal open throughout validation and posting.
     posting=true;
-    this.disabled=true;this.textContent='Posting...';get('submitBtn').disabled=true;
-    form.submit();
+    const button=get('submitBtn');
+    button.disabled=true;
+    const oldText=button.textContent;
+    button.textContent='Posting...';
+    try {
+      const response=await fetch(form.action||window.location.href,{
+        method:'POST',body:new FormData(form),
+        headers:{'Accept':'application/json'},credentials:'same-origin'
+      });
+      const contentType=response.headers.get('content-type')||'';
+      if(!contentType.includes('application/json'))throw new Error('Unexpected server response. Please refresh and try again.');
+      const data=await response.json();
+      if(!response.ok||!data.ok){
+        if(data.field==='reference' && !isBack()){
+          reference.classList.add('is-invalid');
+          get('referenceError').textContent='Duplicate Transaction ID';
+          reference.focus();
+        }else{
+          get('transactionEntryError').textContent=data.error||'Unable to post transaction.';
+          get('transactionEntryError').classList.remove('d-none');
+        }
+        return;
+      }
+      window.location.assign(data.redirect||window.location.href);
+    }catch(error){
+      get('transactionEntryError').textContent=error.message||'Unable to post transaction. Please try again.';
+      get('transactionEntryError').classList.remove('d-none');
+    }finally{
+      posting=false;button.disabled=false;button.textContent=oldText;
+    }
   });
-  refresh();
+  const entryModal=get('newTransactionEntryModal');
+  document.querySelector('[data-bs-target="#newTransactionEntryModal"]').addEventListener('click',()=>{
+    entryModal.dataset.quickMode='all';
+    get('newTransactionEntryTitle').textContent='Add New Transaction';
+    // Add Transaction shows only types not handled by dedicated quick actions.
+    const generalKinds=['dealer_sell','dealer_buy','transfer','cash_in','cash_out'];
+    [...kind.options].forEach(option=>{option.hidden=!generalKinds.includes(option.value);option.disabled=!generalKinds.includes(option.value);});
+    kind.value='dealer_sell';
+    clearReferenceError();updateReference();refresh();
+  });
+  document.querySelectorAll('[data-quick-kind]').forEach(button=>button.addEventListener('click',()=>{
+    const mode=button.dataset.quickKind;
+    entryModal.dataset.quickMode=mode;
+    // Withdraw only offers bank-paid and dealer-paid customer withdrawals.
+    [...kind.options].forEach(option=>{const enabled=mode==='withdrawal'?['withdrawal','dealer_payout'].includes(option.value):option.value===mode;option.hidden=!enabled;option.disabled=!enabled;});
+    kind.value=mode;clearReferenceError();updateReference();refresh();
+    get('newTransactionEntryTitle').textContent={deposit:'New Deposit',withdrawal:'New Withdrawal',unclaim:'New Unclaim',deposit_back:'New Deposit Back'}[mode];
+    bootstrap.Modal.getOrCreateInstance(entryModal).show();
+  }));
+  // Default to the remaining general transaction types when the page loads.
+  const generalKinds=['dealer_sell','dealer_buy','transfer','cash_in','cash_out'];
+  [...kind.options].forEach(option=>{option.hidden=!generalKinds.includes(option.value);option.disabled=!generalKinds.includes(option.value);});
+  kind.value='dealer_sell';updateReference();refresh();
+});
+</script>
+<script>
+(function () {
+  const tabs = document.querySelectorAll('[data-newtx-bank-tab]');
+  const rows = document.querySelectorAll('[data-newtx-bank-row]');
+  if (!tabs.length || !rows.length) return;
+  function apply(value) {
+    rows.forEach(row => {
+      const group = row.dataset.bankGroup;
+      const status = row.dataset.bankStatus;
+      const active = row.dataset.bankActive === '1';
+      const show = value === 'all' ||
+        (value === 'active' && status === 'active' && active) ||
+        (value === 'problem' && status !== 'active' && status !== 'closed') ||
+        (value.startsWith('group:') && group === value.slice(6));
+      row.hidden = !show;
+      row.style.display = show ? '' : 'none';
+    });
+    tabs.forEach(tab => {
+      const selected = tab.dataset.newtxBankTab === value;
+      tab.classList.toggle('btn-primary', selected);
+      tab.classList.toggle('btn-outline-primary', !selected);
+      tab.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    });
+  }
+  tabs.forEach(tab => tab.addEventListener('click', () => apply(tab.dataset.newtxBankTab)));
+  apply('active');
 })();
 </script>
+<script>
+document.addEventListener('click', async function(event) {
+ const copy=event.target.closest('.newtx-copy-field');
+ if(copy){
+  const field=document.getElementById(copy.dataset.target);
+  if(!field||!field.value||copy.disabled)return;
+  try {
+   if(navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(field.value);
+   else {field.focus();field.select();if(!document.execCommand('copy'))throw new Error('Copy unavailable');field.setSelectionRange(0,0);}
+   const old=copy.textContent;copy.textContent='Copied!';setTimeout(()=>{copy.textContent=old;},1400);
+  }catch(err){alert('Unable to copy. Please select the value manually.');}
+  return;
+ }
+ const reveal=event.target.closest('.newtx-reveal-password');
+ const toggle=event.target.closest('.newtx-toggle-password');
+ if(toggle){const input=document.getElementById(toggle.dataset.target);if(input){input.type=input.type==='password'?'text':'password';toggle.textContent=input.type==='password'?'Show':'Hide';}return;}
+ if(!reveal)return;
+ const input=document.getElementById(reveal.dataset.target);if(!input)return;
+ reveal.disabled=true;
+ try {
+  const response=await fetch(reveal.dataset.url,{method:'POST',credentials:'same-origin',headers:{'X-CSRFToken':{{ csrf_token()|tojson }},'Accept':'application/json'},cache:'no-store'});
+  if(!response.ok)throw new Error('Password access denied or unavailable ('+response.status+')');
+  const data=await response.json();input.value=data.password||'';input.type='text';
+  const toggleButton=document.querySelector('.newtx-toggle-password[data-target="'+reveal.dataset.target+'"]');if(toggleButton){toggleButton.hidden=false;toggleButton.textContent='Hide';}
+  const copyButton=document.querySelector('.newtx-copy-field[data-target="'+reveal.dataset.target+'"]');if(copyButton)copyButton.disabled=!input.value;
+  reveal.textContent='Reveal Again';
+ }catch(error){alert(error.message);}finally{reveal.disabled=false;}
+});
+document.addEventListener('hidden.bs.modal',function(event){const input=event.target.querySelector('input[id^="newtx-password-"]');if(input){input.value='';input.type='password';const copy=event.target.querySelector('.newtx-copy-field[data-target="'+input.id+'"]');if(copy){copy.disabled=true;copy.textContent='Copy';}const toggle=event.target.querySelector('.newtx-toggle-password');if(toggle){toggle.hidden=true;toggle.textContent='Hide';}}});
+</script>
+
+{% if duplicate_form_state %}
+<script>
+document.addEventListener('DOMContentLoaded',function(){
+  const values={{ duplicate_form_state|tojson }};
+  const form=document.getElementById('newTransactionForm');
+  if(!form)return;
+  const kind=form.elements.namedItem('kind');
+  if(kind && values.kind){kind.value=values.kind;kind.dispatchEvent(new Event('change',{bubbles:true}));}
+  for(const [key,value] of Object.entries(values)){
+    if(key==='csrf_token'||key==='kind')continue;
+    const field=form.elements.namedItem(key);
+    if(field && typeof field.value==='string')field.value=value;
+  }
+  for(const field of ['amount','rate']){const el=form.elements.namedItem(field);if(el)el.dispatchEvent(new Event('input',{bubbles:true}));}
+  const reference=form.elements.namedItem('reference');
+  reference.classList.add('is-invalid');
+  document.getElementById('referenceError').textContent='Duplicate Transaction ID';
+  const modal=document.getElementById('newTransactionEntryModal');
+  bootstrap.Modal.getOrCreateInstance(modal).show();
+  modal.addEventListener('shown.bs.modal',()=>reference.focus(),{once:true});
+});
+</script>
+{% endif %}
 {% endblock %}

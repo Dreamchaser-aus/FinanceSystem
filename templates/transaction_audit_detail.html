@@ -6,7 +6,7 @@
 <div class="col-md-6"><div class="text-muted small">Transaction Reference</div><strong>{{(after or before or {}).get('reference',item.transaction.reference)}}</strong></div>
 <div class="col-md-6"><div class="text-muted small">Platform</div><strong>{{platform_name}}</strong></div>
 <div class="col-md-6"><div class="text-muted small">Performed By</div><strong>{{item.actor.username}}</strong></div>
-<div class="col-md-6"><div class="text-muted small">Date &amp; Time (Malaysia)</div><strong>{{item.created_at|mytime}}</strong></div>
+<div class="col-md-6"><div class="text-muted small">Date &amp; Time (Melbourne)</div><strong>{{item.created_at|mytime}}</strong></div>
 <div class="col-md-6"><div class="text-muted small">Action</div><span class="badge {{'bg-danger' if item.action=='VOID' else 'bg-primary' if item.action=='EDIT' else 'bg-success'}}">{{action_label.get(item.action,item.action)}}</span></div>
 {% if item.reason %}<div class="col-12"><div class="text-muted small">Reason for Deletion</div><strong>{{item.reason}}</strong></div>{% endif %}
 </div></div>

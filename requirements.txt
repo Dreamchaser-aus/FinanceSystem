@@ -6,3 +6,4 @@ psycopg[binary]>=3.2,<4
 gunicorn>=22,<25
 python-dotenv>=1,<2
 cryptography>=43,<47
+tzdata

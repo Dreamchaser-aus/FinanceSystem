@@ -1,0 +1,6 @@
+{% extends 'base.html' %}{% block content %}
+<h3>UTC Period Reconciliation — {{day}}</h3>
+<p class="text-muted">UTC interval [{{start.isoformat()}}, {{end.isoformat()}}). Unclaimed deposits are excluded from posted ledger balances.</p>
+<table class="table table-striped"><thead><tr><th>Bank</th><th>Opening</th><th>IN</th><th>OUT</th><th>Closing</th><th>Check</th></tr></thead><tbody>
+{% for b in banks %}{% set r=rows[b.id] %}<tr><td>{{b.name}}</td><td>{{r.opening|rm}}</td><td>{{r.in_amount|rm}}</td><td>{{r.out_amount|rm}}</td><td>{{r.day_close|rm}}</td><td>{% if r.opening+r.in_amount-r.out_amount==r.day_close %}PASS{% else %}FAIL{% endif %}</td></tr>{% endfor %}
+</tbody></table>{% endblock %}

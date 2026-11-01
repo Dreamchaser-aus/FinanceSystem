@@ -21,7 +21,7 @@
 </div>
 <div class="card p-3">
  <div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Confirmed movements</h5><span class="text-muted small">{{count}} entries · Page {{page}} / {{pages}}</span></div>
- <div class="table-responsive"><table class="table table-hover"><thead><tr><th>Business date</th><th>Created (MYT)</th><th>Reference</th><th>Customer</th><th>Type</th><th>Direction</th><th class="text-end">Amount (AUD)</th><th>Remark</th></tr></thead><tbody>
+ <div class="table-responsive"><table class="table table-hover"><thead><tr><th>Business date</th><th>Created (Melbourne)</th><th>Reference</th><th>Customer</th><th>Type</th><th>Direction</th><th class="text-end">Amount (AUD)</th><th>Remark</th></tr></thead><tbody>
  {% for entry,tx in movements %}<tr><td class="text-nowrap">{{tx.business_date}}</td><td class="text-nowrap">{{tx.created_at.astimezone(myt).strftime('%d/%m/%Y %H:%M') if myt is defined else tx.created_at.strftime('%d/%m/%Y %H:%M')}}</td><td class="fw-semibold">{{tx.reference}}</td><td>{{tx.customer_ref or '—'}}</td><td>{{tx.kind|replace('_',' ')|title}}</td><td><span class="badge {{'bg-success' if entry.delta>0 else 'bg-danger'}}">{{'IN' if entry.delta>0 else 'OUT'}}</span></td><td class="money text-end {{'text-success' if entry.delta>0 else 'text-danger'}}">{{'+' if entry.delta>0 else '−'}}{{(entry.delta|abs)|rm}}</td><td>{{tx.remark or '—'}}</td></tr>
  {% else %}<tr><td colspan="8" class="text-muted text-center py-4">No confirmed movements match these filters.</td></tr>{% endfor %}
  </tbody></table></div>

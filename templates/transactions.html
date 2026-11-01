@@ -1,25 +1,28 @@
 {% extends 'base.html' %}
 {% block content %}
-<style>.bf-transaction-table thead th,.bf-transaction-table tbody td{text-align:center!important;vertical-align:middle}.bf-transaction-table tbody tr{transition:background .15s}.bf-transaction-table td{padding:11px 10px}.bf-transaction-table .font-monospace{font-size:.78rem}.bf-transaction-table .btn{min-width:68px}</style>
+<style>.bf-filter-mode{width:140px}.bf-filter-day{width:170px}.bf-filter-bank{min-width:175px;max-width:260px;flex:1}.bf-compact-filters .btn{white-space:nowrap}.bf-transaction-table thead th,.bf-transaction-table tbody td{text-align:center!important;vertical-align:middle}.bf-transaction-table tbody tr{transition:background .15s}.bf-transaction-table td{padding:11px 10px}.bf-transaction-table .font-monospace{font-size:.78rem}.bf-transaction-table .btn{min-width:68px}</style>
 <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
   <div><h3 class="mb-1">Transaction Management</h3><div class="text-muted">Search, filter and review transactions</div></div>
   <a class="btn btn-primary" href="{{ url_for('new_transaction') }}">+ New Transaction</a>
 </div>
 <div class="card p-3 p-lg-4">
   <form method="get" action="{{ url_for('transactions') }}">
-    <input type="hidden" name="date" value="{{selected_day.isoformat()}}">
+    
     <div class="mb-3"><input class="form-control" name="search" value="{{ search }}" placeholder="Search customer, transaction ID or bank..." aria-label="Search transactions"></div>
     <div class="d-flex flex-wrap gap-3 mb-3"><span class="fw-semibold">Types:</span>
-      {% for value,label in [('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer')] %}
+      {% for value,label in [('deposit','Deposit'),('withdrawal','Withdrawal'),('transfer','Transfer'),('cash_in','Cash In'),('cash_out','Cash Out'),('internal_transfer','Internal Transfer')] %}
       <label class="form-check"><input class="form-check-input" type="checkbox" name="kind" value="{{value}}" {% if value in kinds %}checked{% endif %}><span class="form-check-label">{{label}}</span></label>
       {% endfor %}<span class="text-muted small">None checked = All types</span></div>
-    <div class="row g-2 align-items-center mb-3">
-      <div class="col-12 col-sm-6 col-lg-4"><select class="form-select" name="bank_id" aria-label="Filter by bank"><option value="">All Banks</option>{% for b in banks %}<option value="{{ b.id }}" {% if bank_id == b.id %}selected{% endif %}>{{ b.name }}</option>{% endfor %}</select></div>
-      <div class="col-auto"><button class="btn btn-primary" type="submit">Apply Filters</button></div>
-      <div class="col-auto"><a class="btn btn-outline-secondary" href="{{ url_for('transactions') }}">Reset</a></div>
-      <div class="col text-end text-muted small">{{ records.total }} records</div>
+    <div class="d-flex flex-wrap align-items-end gap-2 mb-3 bf-compact-filters">
+      <div class="bf-filter-mode"><label class="form-label small mb-1" for="transaction-date-mode">Date</label><select class="form-select form-select-sm" id="transaction-date-mode" name="all_dates"><option value="1" {% if all_dates %}selected{% endif %}>All Dates</option><option value="0" {% if not all_dates %}selected{% endif %}>Selected Date</option></select></div>
+      <div class="bf-filter-day" id="bf-transaction-day-wrap"><label class="form-label small mb-1" for="transaction-report-date">Report Date</label><input class="form-control form-control-sm" id="transaction-report-date" type="date" name="date" value="{{selected_day.isoformat()}}" max="{{today_myt}}"></div>
+      <div class="bf-filter-bank"><label class="form-label small mb-1" for="transaction-bank">Bank</label><select class="form-select form-select-sm" id="transaction-bank" name="bank_id"><option value="">All Banks</option>{% for b in banks %}<option value="{{ b.id }}" {% if bank_id == b.id %}selected{% endif %}>{{ b.name }}</option>{% endfor %}</select></div>
+      <button class="btn btn-primary btn-sm" type="submit">Apply Filters</button>
+      <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('transactions') }}">Reset</a>
+      <span class="small text-muted ms-auto align-self-center">{{ records.total }} records</span>
     </div>
   </form>
+  <script>document.addEventListener("DOMContentLoaded",function(){const mode=document.getElementById("transaction-date-mode"),wrap=document.getElementById("bf-transaction-day-wrap"),day=document.getElementById("transaction-report-date");if(!mode||!wrap)return;function update(){const selected=mode.value==="0";wrap.style.display=selected?"":"none";day.disabled=!selected;}mode.addEventListener("change",update);update();});</script>
   <div class="table-responsive">
     <table class="table table-hover align-middle bf-transaction-table text-center">
       <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th>Amount</th><th>Actions</th></tr></thead>
@@ -28,11 +31,11 @@
         <tr class="{{'table-danger' if t.status=='voided' else ''}}">
           <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} Business GMT</div>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span>{% endif %}</td>
           <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
-            {% if t.kind == 'deposit' %}<span class="badge bg-success">Deposit</span>
-            {% elif t.kind == 'withdrawal' %}<span class="badge bg-danger">Withdrawal</span>
+            {% if t.kind in ('deposit','cash_in') %}<span class="badge bg-success">Deposit</span>
+            {% elif t.kind in ('withdrawal','cash_out') %}<span class="badge bg-danger">Withdrawal</span>
             {% else %}<span class="badge bg-primary">Transfer</span>{% endif %}
           </td>
-          <td class="money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind == 'deposit' else ('text-danger' if t.kind == 'withdrawal' else '')) }}">{% if t.kind == 'deposit' %}+{% elif t.kind == 'withdrawal' %}−{% endif %}{{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and can('edit_transaction') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<div class="d-flex justify-content-center gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
+          <td class="money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind in ('deposit','cash_in') else ('text-danger' if t.kind in ('withdrawal','cash_out') else '')) }}">{% if t.kind in ('deposit','cash_in') %}+{% elif t.kind in ('withdrawal','cash_out') %}−{% endif %}{{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and can('edit_transaction') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<div class="d-flex justify-content-center gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
         </tr>
       {% else %}
         <tr><td colspan="4" class="text-center text-muted py-4">No matching transactions</td></tr>
@@ -43,8 +46,8 @@
   <div class="d-flex justify-content-between align-items-center gap-2">
     <span class="small text-muted">Page {{ records.page }} / {{ records.pages or 1 }}</span>
     <div class="d-flex gap-2">
-      {% if records.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.prev_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat()) }}">Previous</a>{% endif %}
-      {% if records.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.next_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat()) }}">Next</a>{% endif %}
+      {% if records.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.prev_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat(),all_dates=1 if all_dates else 0) }}">Previous</a>{% endif %}
+      {% if records.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{ url_for('transactions',page=records.next_num,search=search,kind=kinds,bank_id=bank_id,date=selected_day.isoformat(),all_dates=1 if all_dates else 0) }}">Next</a>{% endif %}
     </div>
   </div>
 </div>

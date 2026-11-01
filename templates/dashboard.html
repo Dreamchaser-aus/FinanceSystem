@@ -1,7 +1,7 @@
 {% extends 'base.html' %}
 {% block content %}
 <div class="d-flex justify-content-between align-items-center flex-wrap mb-3"><h3>Financial Dashboard <small class="text-muted fs-6 fw-normal">· AUD</small></h3><span class="badge bg-primary">{{selected_day}} · Business GMT</span></div>
-<div class="d-flex flex-wrap align-items-center gap-2 mb-3"><form method="get" action="{{url_for('dashboard')}}" class="d-flex flex-wrap align-items-center gap-2"><span class="small text-muted">Date range</span><input class="form-control form-control-sm" style="width:148px" aria-label="From date" type="date" name="start_date" value="{{start_day.isoformat()}}" max="{{today_myt}}" required><span class="text-muted">–</span><input class="form-control form-control-sm" style="width:148px" aria-label="To date" type="date" name="end_date" value="{{selected_day.isoformat()}}" max="{{today_myt}}" required><button class="btn btn-sm btn-primary">Apply</button><a class="btn btn-sm btn-outline-secondary" href="{{url_for('dashboard')}}">Today</a></form><small class="text-muted">Balances as of end date · Business GMT</small></div>
+<div class="d-flex flex-wrap align-items-center gap-2 mb-3"><form method="get" action="{{url_for('dashboard')}}" class="d-flex flex-wrap align-items-center gap-2"><span class="small text-muted">Date range</span><input class="form-control form-control-sm" style="width:148px" aria-label="From date" type="date" name="start_date" value="{{start_day.isoformat()}}" max="{{today_myt}}" required><span class="text-muted">–</span><input class="form-control form-control-sm" style="width:148px" aria-label="To date" type="date" name="end_date" value="{{selected_day.isoformat()}}" max="{{today_myt}}" required><button class="btn btn-sm btn-primary">Apply</button><a class="btn btn-sm btn-outline-secondary" href="{{url_for('dashboard')}}">Today</a></form><small class="text-muted">Selected period UTC window · {{range_start_utc.strftime("%Y-%m-%d %H:%M")}} → {{range_end_utc.strftime("%Y-%m-%d %H:%M")}} UTC</small></div>
 <style>
 .bf-kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}
 .bf-kpi{min-width:0;min-height:96px;padding:13px 15px;background:#fff;border:1px solid #e2eaf3;border-radius:13px;box-shadow:0 2px 10px rgba(18,49,83,.035);display:flex;flex-direction:column;justify-content:space-between}
@@ -31,14 +31,79 @@
 {% endif %}
 </section>
 {% endif %}
-{% if can("view_bank_balances") %}<div class="card p-3 mb-3"><h5>Active Bank Balances</h5><p class="small text-muted">Opening and IN/OUT use the selected report end date. Before Unclaimed is confirmed ledger only; With Unclaimed is for bank-app comparison. Historical Unclaimed status is based on current status.</p><div class="table-responsive"><table class="table table-hover"><thead><tr><th>Bank</th><th>Group</th><th class="text-end">Opening</th><th class="text-end">Before Unclaimed</th><th class="text-end">Unclaimed</th><th class="text-end">With Unclaimed</th><th class="text-end">IN (Count / Amount)</th><th class="text-end">OUT (Count / Amount)</th></tr></thead><tbody>{% for b in banks %}<tr><td>{{b.name}}</td><td>{{b.kind|title}}</td>
+{% if can("view_bank_balances") %}<div class="card p-3 mb-3" id="bank-balances">
+<div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+  {% for value,title in [('active','Active Banks'),('group:deposit','Deposit Bank'),('group:withdrawal','Withdraw Bank'),('group:store','Store'),('problem','Problem Bank'),('all','All Banks')] %}
+  <a data-bank-tab="1" class="btn btn-sm {{'btn-primary' if selected_category==value else 'btn-outline-primary'}}" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),category=value,bank_group=selected_bank_groups)}}">{{title}}</a>
+  {% endfor %}
+
+</div>
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2"><h5 class="mb-0">Active Bank Balances</h5><form method="get" action="{{url_for('dashboard')}}" class="d-flex align-items-center gap-2"><input type="hidden" name="start_date" value="{{start_day.isoformat()}}"><input type="hidden" name="end_date" value="{{selected_day.isoformat()}}"><input type="hidden" name="category" value="{{selected_category}}"><div class="dropdown"><button class="btn btn-sm btn-outline-primary dropdown-toggle" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">Groups: {{selected_bank_groups|join(', ')|title if selected_bank_groups else 'All'}}</button><div class="dropdown-menu p-3 shadow-sm" style="min-width:210px;max-height:300px;overflow-y:auto"><div class="small text-muted mb-2">Select one or multiple groups</div>{% for group in available_bank_groups %}<label class="dropdown-item d-flex gap-2 align-items-center px-1"><input type="checkbox" class="form-check-input mt-0" name="bank_group" value="{{group}}" {% if group in selected_bank_groups %}checked{% endif %}><span>{{group|title}}</span></label>{% else %}<div class="small text-muted">No active bank groups</div>{% endfor %}<div class="d-flex gap-2 mt-2"><button type="submit" class="btn btn-primary btn-sm flex-fill">Apply</button><a class="btn btn-outline-secondary btn-sm" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),category=selected_category)}}">All</a></div></div></div><small class="text-muted">{{filtered_bank_count}} banks</small></form></div><p class="small text-muted">Opening and IN/OUT use the selected UTC closing-period range. Before Unclaimed excludes Unclaim credits posted in the selected period; Unclaimed includes those credits plus pending unclaimed leads. With Unclaimed is for bank-app comparison. Historical Unclaimed uses an exact Closing snapshot when available; otherwise it is shown as unavailable.</p><div class="table-responsive"><table class="table table-hover"><thead><tr><th>Bank</th><th>Group</th><th>Status</th><th class="text-end">Opening</th><th class="text-end">Before Unclaimed</th><th class="text-end">Unclaimed</th><th class="text-end">With Unclaimed</th><th class="text-end">IN</th><th class="text-end">OUT</th></tr></thead><tbody>{% for b in banks %}<tr><td>{{b.name}}</td><td>{{b.kind|title}}</td>
+<td>
+{% if current_user.role in ('admin','staff') %}
+<button type="button" class="btn btn-sm p-0 border-0 bg-transparent" data-bs-toggle="modal" data-bs-target="#bank-status-modal-{{b.id}}" title="Click to update current bank status" aria-label="Update status for {{b.name}}">
+  <span class="badge {{'bg-success' if b.status=='active' else 'bg-secondary' if b.status=='closed' else 'bg-warning text-dark'}}">{{bank_status_options.get(b.status,b.status)}} <span aria-hidden="true">✎</span></span>
+</button>
+{% else %}<span class="badge {{'bg-success' if b.status=='active' else 'bg-secondary' if b.status=='closed' else 'bg-warning text-dark'}}">{{bank_status_options.get(b.status,b.status)}}</span>{% endif %}
+</td>
 <td class="text-end">{{dashboard_bank_stats[b.id].opening|rm}}</td>
-<td class="text-end fw-semibold">{{ledger_balances[b.id]|rm}}</td><td class="text-end">{{dashboard_unclaimed.get(b.id,0)|rm}}</td>
-<td class="text-end fw-bold">{{balances[b.id]|rm}}</td>
+<td class="text-end fw-semibold">{{ledger_balances[b.id]|rm}}</td><td class="text-end">{% if b.id in historical_unclaimed_missing %}<span class="text-muted" title="No exact historical Unclaimed snapshot">N/A</span>{% else %}{{dashboard_unclaimed.get(b.id,0)|rm}}{% endif %}</td>
+<td class="text-end fw-bold">{% if b.id in historical_unclaimed_missing %}<span class="text-muted" title="Historical Unclaimed unavailable">N/A</span>{% else %}{{balances[b.id]|rm}}{% endif %}</td>
 <td class="text-end text-success">{{dashboard_bank_stats[b.id].in_count}}<div class="small">{{dashboard_bank_stats[b.id].in_amount|rm}}</div></td>
-<td class="text-end text-danger">{{dashboard_bank_stats[b.id].out_count}}<div class="small">{{dashboard_bank_stats[b.id].out_amount|rm}}</div></td></tr>{% else %}<tr><td colspan="8">No active banks</td></tr>{% endfor %}</tbody><tfoot class="table-light fw-bold"><tr><td colspan="3">Total (All Active Banks)</td><td class="text-end">{{grand|rm}}</td><td class="text-end">{{total_unclaimed|rm}}</td><td class="text-end">{{active_with_unclaimed|rm}}</td><td colspan="2"></td></tr></tfoot></table></div><div class="d-flex justify-content-between"><small>Page {{bank_page}} / {{bank_pages}}</small><div>{% if bank_page>1 %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),bank_page=bank_page-1)}}">Previous</a>{% endif %} {% if bank_page<bank_pages %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),bank_page=bank_page+1)}}">Next</a>{% endif %}</div></div></div>
+<td class="text-end text-danger">{{dashboard_bank_stats[b.id].out_count}}<div class="small">{{dashboard_bank_stats[b.id].out_amount|rm}}</div></td></tr>{% else %}<tr><td colspan="9">No banks in this category</td></tr>{% endfor %}</tbody><tfoot class="table-light fw-bold"><tr><td colspan="4">Total</td><td class="text-end">{{filtered_ledger_total|rm}}</td><td class="text-end">{{filtered_unclaimed_total|rm}}</td><td class="text-end">{{filtered_with_unclaimed_total|rm}}</td><td colspan="2"></td></tr></tfoot></table></div>
+{% if current_user.role in ('admin','staff') %}
+{% for b in banks %}
+<div class="modal fade" id="bank-status-modal-{{b.id}}" tabindex="-1" aria-labelledby="bank-status-title-{{b.id}}" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-sm"><div class="modal-content">
+    <form method="post" action="{{url_for('update_bank_status',bank_id=b.id)}}">
+      <input type="hidden" name="csrf_token" value="{{csrf_token()}}">
+      <input type="hidden" name="return_to" value="dashboard">
+      <input type="hidden" name="start_date" value="{{start_day.isoformat()}}">
+      <input type="hidden" name="end_date" value="{{selected_day.isoformat()}}">
+      <input type="hidden" name="category" value="{{selected_category}}">
+      {% for group in selected_bank_groups %}<input type="hidden" name="bank_group" value="{{group}}">{% endfor %}
+      <div class="modal-header"><h6 class="modal-title" id="bank-status-title-{{b.id}}">Update Bank Status</h6><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body">
+        <div class="small fw-semibold mb-2">{{b.name}}</div>
+        <label class="form-label small" for="status-select-{{b.id}}">Current status</label>
+        <select id="status-select-{{b.id}}" name="status" class="form-select form-select-sm mb-3" required>
+        {% for value,label in bank_status_options.items() %}<option value="{{value}}" {% if value==b.status %}selected{% endif %}>{{label}}</option>{% endfor %}
+        </select>
+        <label class="form-label small" for="status-reason-{{b.id}}">Reason (required for any non-Active status)</label>
+        <textarea id="status-reason-{{b.id}}" name="remark" maxlength="2000" rows="3" class="form-control form-control-sm" placeholder="Describe the issue">{{b.status_remark or ''}}</textarea>
+      </div>
+      <div class="modal-footer"><button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-sm btn-primary" type="submit">Save Changes</button></div>
+    </form>
+  </div></div>
+</div>
+{% endfor %}
+{% endif %}
+<div class="d-flex justify-content-between"><small>Page {{bank_page}} / {{bank_pages}}</small><div>{% if bank_page>1 %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),bank_page=bank_page-1,bank_group=selected_bank_groups,category=selected_category)}}">Previous</a>{% endif %} {% if bank_page<bank_pages %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),bank_page=bank_page+1,bank_group=selected_bank_groups,category=selected_category)}}">Next</a>{% endif %}</div></div></div>
 {% endif %}{% if can("view_dashboard_closing") %}<div class="card p-3 mb-3"><ul class="nav nav-tabs" role="tablist"><li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#closed-today" type="button">Banks Closed in {{start_day}} – {{selected_day}} ({{closed_count}})</button></li><li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#blocked-today" type="button">Blocked Status ({{block_count}})</button></li></ul><div class="tab-content pt-3"><div class="tab-pane fade show active" id="closed-today"><div class="table-responsive"><table class="table table-sm"><thead><tr><th>Bank</th><th class="text-end">System</th><th class="text-end">Actual</th><th class="text-end">Difference</th><th>Remark</th></tr></thead><tbody>{% for c in closed_banks %}<tr><td>{{c.bank.name}}</td><td class="text-end">{{c.system_balance|rm}}</td><td class="text-end">{{c.actual_balance|rm}}</td><td class="text-end">{{c.difference|rm}}</td><td>{{c.remark or '—'}}</td></tr>{% else %}<tr><td colspan="5">No banks closed for this date</td></tr>{% endfor %}</tbody></table></div><div class="d-flex justify-content-between"><small>Page {{closed_page.page}} / {{closed_page.pages or 1}}</small><div>{% if closed_page.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),close_page=closed_page.prev_num)}}#closed-today">Previous</a>{% endif %} {% if closed_page.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('dashboard',start_date=start_day.isoformat(),end_date=selected_day.isoformat(),close_page=closed_page.next_num)}}#closed-today">Next</a>{% endif %}</div></div></div><div class="tab-pane fade" id="blocked-today"><div class="table-responsive"><table class="table table-sm"><thead><tr><th>Bank</th><th>Reason</th><th class="text-end">Balance</th></tr></thead><tbody>{% for b in block_banks %}<tr><td><a href="{{url_for('blocked_settlements',bank_id=b.id)}}">{{b.name}} · Settlement</a></td><td>Closed / Blocked</td><td class="text-end">{{balances[b.id]|rm}}</td></tr>{% else %}<tr><td colspan="3">No blocked banks</td></tr>{% endfor %}</tbody></table></div></div></div></div>
-{% endif %}{% if can("view_dashboard_transactions") %}<div class="card p-3"><div class="d-flex justify-content-between"><h5>Latest Transactions (20) — {{start_day}} to {{selected_day}}</h5><a href="{{url_for('transactions',date=selected_day.isoformat())}}">View All</a></div><div class="table-responsive"><table class="table table-hover table-sm"><thead><tr><th>Time (Business GMT)</th><th>Platform</th><th>Customer</th><th>Transaction ID</th><th>Type</th><th>Bank</th><th class="text-end">Amount</th><th>Action</th></tr></thead><tbody>{% for t in latest %}<tr class="{{'table-danger' if t.status=='voided' else ''}}"><td>{{t.created_at|mytime}}</td><td>{{platform_names.get(t.platform_id,'Unknown platform')}}</td><td>{{t.customer_ref or '—'}}</td><td>{{t.reference}}</td><td>{{t.kind|replace('_',' ')|title}}</td><td>{{transaction_banks.get(t.id,'Unknown')}}</td><td class="text-end {{'text-decoration-line-through text-danger' if t.status=='voided' else ''}}">{{t.signed_amount|abs|rm}}</td><td>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span><div class="small text-danger">Deleted by: {{deleted_by.get(t.id,'Unknown user')}}</div>{% endif %}{% if t.status=='confirmed' and current_user.role in ('admin','staff') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<button class="btn btn-outline-danger btn-sm" type="button" data-bs-toggle="collapse" data-bs-target="#dash-void-{{t.id}}">Delete</button><form class="collapse mt-2" id="dash-void-{{t.id}}" method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input type="hidden" name="return_to" value="dashboard"><input type="hidden" name="start_date" value="{{start_day.isoformat()}}"><input type="hidden" name="end_date" value="{{selected_day.isoformat()}}"><input class="form-control form-control-sm mb-1" name="reason" minlength="5" maxlength="500" placeholder="Deletion reason" required><button class="btn btn-danger btn-sm" onclick="return confirm('Delete/void this transaction?')">Confirm Delete</button></form>{% elif t.status=='confirmed' and current_user.role in ('admin','staff') %}<small class="text-muted">Today / single platform only</small>{% endif %}</td></tr>{% else %}<tr><td colspan="8">No transactions for this date</td></tr>{% endfor %}</tbody></table></div></div>
+{% endif %}{% if can("view_dashboard_transactions") %}<div class="card p-3"><div class="d-flex justify-content-between"><h5>Latest Transactions (20) — {{start_day}} to {{selected_day}}</h5><a href="{{url_for('transactions',date=selected_day.isoformat())}}">View All</a></div><div class="table-responsive"><table class="table table-hover table-sm"><thead><tr><th>Time (Business GMT)</th><th>Platform</th><th>Customer</th><th>Transaction ID</th><th>Type</th><th>Bank</th><th class="text-end">Amount</th><th>Action</th></tr></thead><tbody>{% for t in latest %}<tr class="{{'table-danger' if t.status=='voided' else ''}}"><td>{{t.created_at|mytime}}</td><td>{{platform_names.get(t.platform_id,'Unknown platform')}}</td><td>{{t.customer_ref or '—'}}</td><td>{{t.reference}}</td><td>{{t.kind|replace('_',' ')|title}}</td><td>{{transaction_banks.get(t.id,'Unknown')}}</td><td class="text-end {{'text-decoration-line-through text-danger' if t.status=='voided' else ''}}">{{t.signed_amount|abs|rm}}</td><td>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span><div class="small text-danger">Deleted by: {{deleted_by.get(t.id,'Unknown user')}}</div>{% endif %}{% if t.status=='confirmed' and current_user.role in ('admin','staff') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<button class="btn btn-outline-danger btn-sm" type="button" data-bs-toggle="modal" data-bs-target="#dash-delete-modal-{{t.id}}">Delete</button>
+<div class="modal fade text-start" id="dash-delete-modal-{{t.id}}" tabindex="-1" aria-labelledby="dash-delete-title-{{t.id}}" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title" id="dash-delete-title-{{t.id}}">Delete Transaction</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+    <form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}">
+      <div class="modal-body">
+        <input type="hidden" name="csrf_token" value="{{csrf_token()}}">
+        <input type="hidden" name="return_to" value="dashboard">
+        <input type="hidden" name="start_date" value="{{start_day.isoformat()}}">
+        <input type="hidden" name="end_date" value="{{selected_day.isoformat()}}">
+        <dl class="row small mb-3">
+          <dt class="col-4 text-muted">Bank</dt><dd class="col-8">{{transaction_banks.get(t.id,'Unknown')}}</dd>
+          <dt class="col-4 text-muted">Transaction ID</dt><dd class="col-8 text-break">{{t.reference}}</dd>
+          <dt class="col-4 text-muted">Type</dt><dd class="col-8">{{t.kind|replace('_',' ')|title}}</dd>
+          <dt class="col-4 text-muted">Amount</dt><dd class="col-8 fw-semibold">AUD {{t.signed_amount|abs|rm}}</dd>
+        </dl>
+        <label class="form-label fw-semibold" for="dash-delete-reason-{{t.id}}">Delete Remark <span class="text-danger">*</span></label>
+        <textarea class="form-control" id="dash-delete-reason-{{t.id}}" name="reason" rows="3" minlength="5" maxlength="500" placeholder="Enter the reason for deleting this transaction (minimum 5 characters)" required></textarea>
+        <div class="form-text">The transaction is voided with an audit trail. Finalized Closing transactions cannot be deleted.</div>
+      </div>
+      <div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-danger">Confirm Delete</button></div>
+    </form>
+  </div></div>
+</div>{% elif t.status=='confirmed' and current_user.role in ('admin','staff') %}<small class="text-muted">Today / single platform only</small>{% endif %}</td></tr>{% else %}<tr><td colspan="8">No transactions for this date</td></tr>{% endfor %}</tbody></table></div></div>
 {% endif %}{% if can("view_dashboard_dealers") %}<div class="card p-3 mb-3" id="dealer-overview">
 <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3"><div><h5 class="mb-1">Exchange Dealer Overview</h5><p class="small text-muted mb-0">Confirmed AUD movements and MYR settlement balances in selected report date range</p></div><a class="btn btn-outline-primary btn-sm" href="{{url_for('dealers')}}">View Dealer Ledger →</a></div>
 <div class="table-responsive"><table class="table table-hover align-middle"><thead><tr><th>Exchange Dealer</th><th class="text-end">AUD Sent</th><th class="text-end">AUD Received</th><th class="text-end">Direct Payout (AUD)</th><th class="text-end">Net Settlement (MYR)</th></tr></thead><tbody>
@@ -46,4 +111,50 @@
 {% else %}<tr><td colspan="5" class="text-muted text-center py-4">No dealers yet. Add a dealer from Banks.</td></tr>{% endfor %}
 </tbody></table></div><small class="text-muted">Positive MYR net = dealer owes us; negative = we owe dealer. Not a confirmed settlement.</small></div>
 {% endif %}
+
+<script>
+// Swap only the balances card when changing its tabs; the page does not reload or jump.
+(function () {
+  let activeRequest = null;
+  async function switchBankTab(link) {
+    const card = document.getElementById('bank-balances');
+    if (!card) return;
+    if (activeRequest) activeRequest.abort();
+    const controller = new AbortController();
+    activeRequest = controller;
+    const url = link.href;
+    card.setAttribute('aria-busy', 'true');
+    try {
+      const response = await fetch(url, {credentials: 'same-origin', signal: controller.signal, headers: {'X-Requested-With': 'XMLHttpRequest'}});
+      if (!response.ok) throw new Error('Failed to load bank balances');
+      const documentResult = new DOMParser().parseFromString(await response.text(), 'text/html');
+      const updated = documentResult.getElementById('bank-balances');
+      if (!updated) throw new Error('Bank balances section not found');
+      if (activeRequest !== controller) return;
+      // Preserve the current viewport position even if the card changes height.
+      const before = card.getBoundingClientRect().top;
+      card.replaceWith(updated);
+      const after = updated.getBoundingClientRect().top;
+      if (Math.abs(after - before) > 1) window.scrollBy({top: after - before, behavior: 'instant'});
+      history.pushState({bankTab: true}, '', url);
+    } catch (error) {
+      if (error.name !== 'AbortError') window.location.assign(url);
+    } finally {
+      if (activeRequest === controller) {
+        activeRequest = null;
+        const current = document.getElementById('bank-balances');
+        if (current) current.removeAttribute('aria-busy');
+      }
+    }
+  }
+  document.addEventListener('click', function (event) {
+    const link = event.target.closest('#bank-balances a[data-bank-tab]');
+    if (!link || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    switchBankTab(link);
+  });
+  window.addEventListener('popstate', function () { window.location.reload(); });
+})();
+</script>
+
 {% endblock %}

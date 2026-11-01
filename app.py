@@ -1,18 +1,22 @@
-import os, uuid, json
-from datetime import datetime, timezone, date, timedelta
+import os, uuid, json, hashlib, secrets, subprocess, tempfile, shutil
+from datetime import datetime, timezone, date, timedelta, time
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from zoneinfo import ZoneInfo
-from flask import Flask, render_template, redirect, url_for, flash, request, abort, g, session
+from flask import Flask, render_template, redirect, url_for, flash, request, abort, g, session, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import func, select, UniqueConstraint, or_, and_, case
+from sqlalchemy import func, select, UniqueConstraint, Index, or_, and_, case, text, delete
 from sqlalchemy.exc import IntegrityError
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet, InvalidToken
+from closing_engine import next_boundary, as_utc, effective_timezone
+from period_reporting import utc_bank_overview, utc_ledger
+from financial_integrity import verify_period
 
-MYT=ZoneInfo(os.getenv('BUSINESS_TIMEZONE','Asia/Kuala_Lumpur'))
+# Legacy name kept to limit the diff: this is the business display timezone, now Melbourne by default.
+MYT=ZoneInfo(os.getenv('BUSINESS_TIMEZONE','Australia/Melbourne'))
 db=SQLAlchemy(); login_manager=LoginManager(); csrf=CSRFProtect()
 
 def now(): return datetime.now(timezone.utc)
@@ -136,7 +140,7 @@ def bank_for_platform(bank_id,pid):
 class Bank(db.Model):
     platform_id=db.Column(db.String(36),db.ForeignKey("platform.id"),nullable=False,index=True)
     id=db.Column(db.String(36),primary_key=True,default=idgen)
-    name=db.Column(db.String(120),unique=True,nullable=False)
+    name=db.Column(db.String(120),nullable=False)
     kind=db.Column(db.String(20),nullable=False,default='deposit')
     opening_balance=db.Column(db.Numeric(18,2),nullable=False,default=0)
     active=db.Column(db.Boolean,nullable=False,default=True)
@@ -145,6 +149,7 @@ class Bank(db.Model):
     status_updated_at=db.Column(db.DateTime(timezone=True))
     status_updated_by=db.Column(db.String(36),db.ForeignKey('user.id'))
     created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+    __table_args__=(UniqueConstraint('platform_id','name',name='uq_bank_platform_name'),)
 
 class BankDetail(db.Model):
     __tablename__='bank_detail'
@@ -236,7 +241,7 @@ class BankLabel(db.Model):
 class BankLabelAssignment(db.Model):
     __tablename__='bank_label_assignment'
     bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),primary_key=True)
-    label_id=db.Column(db.String(36),db.ForeignKey('bank_label.id'),nullable=False,index=True)
+    label_id=db.Column(db.String(36),db.ForeignKey('bank_label.id'),primary_key=True,index=True)
 
 class BankStatusHistory(db.Model):
     __tablename__='bank_status_history'
@@ -313,7 +318,33 @@ class UnclaimedDeposit(db.Model):
     created_by=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
     created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
     bank=db.relationship('Bank')
-    __table_args__=(UniqueConstraint('bank_id','reference',name='uq_unclaimed_bank_reference'),)
+    __table_args__=(UniqueConstraint('bank_id','reference',name='uq_unclaimed_bank_reference'),
+        Index('uq_unclaimed_transaction_link', 'transaction_id', unique=True, postgresql_where=db.text('transaction_id IS NOT NULL'), sqlite_where=db.text('transaction_id IS NOT NULL')))
+
+class UnclaimAllocation(db.Model):
+    """Immutable allocation event; no bank Entry is posted."""
+    __tablename__='unclaim_allocation'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    original_transaction_id=db.Column(db.String(36),db.ForeignKey('transaction.id'),nullable=False,index=True)
+    platform_id=db.Column(db.String(36),db.ForeignKey('platform.id'),nullable=False,index=True)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
+    deposit_reference=db.Column(db.String(120),unique=True,nullable=False)
+    customer_ref=db.Column(db.String(120),nullable=False)
+    amount=db.Column(db.Numeric(18,2),nullable=False)
+    reason=db.Column(db.Text,nullable=False)
+    created_by=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now,index=True)
+
+class OperatingClosingSnapshot(db.Model):
+    """Immutable operating figures; separate from existing actual-ledger snapshot."""
+    __tablename__='operating_closing_snapshot'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    closing_period_id=db.Column(db.String(36),db.ForeignKey('closing_period.id'),nullable=False,unique=True)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
+    actual_bank_closing=db.Column(db.Numeric(18,2),nullable=False)
+    pending_unclaimed_closing=db.Column(db.Numeric(18,2),nullable=False)
+    operating_closing=db.Column(db.Numeric(18,2),nullable=False)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
 
 class BlockedUnclaimedSettlement(db.Model):
     """Immutable point-in-time bank block snapshot; never posts ledger entries."""
@@ -346,6 +377,21 @@ class Closing(db.Model):
     __table_args__=(UniqueConstraint('bank_id','business_date',name='uq_bank_date'),)
     bank=db.relationship('Bank')
 
+class ClosingFinancialSnapshot(db.Model):
+    """Write-once financial and unclaimed snapshot at the bank's UTC closing boundary."""
+    __tablename__='closing_financial_snapshot'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    closing_period_id=db.Column(db.String(36),db.ForeignKey('closing_period.id'),nullable=False,unique=True)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
+    opening=db.Column(db.Numeric(18,2),nullable=False)
+    incoming=db.Column(db.Numeric(18,2),nullable=False)
+    outgoing=db.Column(db.Numeric(18,2),nullable=False)
+    closing_balance=db.Column(db.Numeric(18,2),nullable=False)
+    unclaimed_amount=db.Column(db.Numeric(18,2),nullable=False)
+    unclaimed_count=db.Column(db.Integer,nullable=False)
+    unclaimed_json=db.Column(db.Text,nullable=False)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+
 class BusinessTimezoneChange(db.Model):
     """Append-only timezone policy; timestamps before each change keep their prior GMT offset."""
     __tablename__='business_timezone_change'
@@ -354,12 +400,46 @@ class BusinessTimezoneChange(db.Model):
     offset_minutes=db.Column(db.Integer,nullable=False)
     actor_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
 
+class ClosingPolicy(db.Model):
+    """Current policy for FUTURE boundaries only; historical periods remain immutable."""
+    __tablename__='closing_policy'
+    id=db.Column(db.Integer,primary_key=True)
+    auto_timezone=db.Column(db.Boolean,nullable=False,default=True)
+    manual_offset_minutes=db.Column(db.Integer,nullable=False,default=600)
+    closing_hour=db.Column(db.Integer,nullable=False,default=0)
+    closing_minute=db.Column(db.Integer,nullable=False,default=0)
+    updated_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+    updated_by=db.Column(db.String(36),db.ForeignKey('user.id'))
+
+class ClosingPeriod(db.Model):
+    """Explicit per-bank immutable UTC boundaries. Historical rows are NOT backfilled."""
+    __tablename__='closing_period'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    bank_id=db.Column(db.String(36),db.ForeignKey('bank.id'),nullable=False,index=True)
+    start_utc=db.Column(db.DateTime(timezone=True),nullable=False)
+    end_utc=db.Column(db.DateTime(timezone=True),nullable=False)
+    status=db.Column(db.String(20),nullable=False,default='closed')
+    closing_id=db.Column(db.String(36),db.ForeignKey('closing.id'),unique=True)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+    __table_args__=(UniqueConstraint('bank_id','start_utc',name='uq_closing_period_start'),UniqueConstraint('bank_id','end_utc',name='uq_closing_period_end'))
+
 class Audit(db.Model):
     id=db.Column(db.String(36),primary_key=True,default=idgen)
     actor_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False)
     action=db.Column(db.String(60),nullable=False)
     detail=db.Column(db.Text)
     created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+
+class PlatformResetBackupProof(db.Model):
+    """Shared, short-lived server-side proof of a completed pg_dump generation."""
+    __tablename__='platform_reset_backup_proof'
+    id=db.Column(db.String(36),primary_key=True,default=idgen)
+    admin_id=db.Column(db.String(36),db.ForeignKey('user.id'),nullable=False,index=True)
+    platform_id=db.Column(db.String(36),db.ForeignKey('platform.id'),nullable=False,index=True)
+    nonce_hash=db.Column(db.String(64),nullable=False)
+    created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=now)
+    expires_at=db.Column(db.DateTime(timezone=True),nullable=False)
+    used=db.Column(db.Boolean,nullable=False,default=False)
 
 class TransactionAudit(db.Model):
     """Append-only application audit; created in same DB transaction as ledger changes."""
@@ -410,6 +490,38 @@ def balances():
     changes=dict(rows)
     return {b.id:money(b.opening_balance)+money(changes.get(b.id,0)) for b in Bank.query.all()}
 
+def ledger_balance_at_utc(bank_id, end_utc):
+    """Historical ledger snapshot at an exclusive UTC boundary."""
+    bank=db.session.get(Bank,bank_id)
+    if bank is None: raise ValueError('Bank not found')
+    return money(bank.opening_balance)+money(utc_ledger(db,Bank,Entry,Transaction,[bank_id],end_utc).get(bank_id,0))
+
+def pending_unclaim_at_utc(bank_id, end_utc):
+    """Cumulative posted Unclaims less allocations, as of an exclusive UTC instant."""
+    credited=db.session.execute(select(func.coalesce(func.sum(Entry.delta),0))
+        .join(Transaction,Entry.transaction_id==Transaction.id)
+        .where(Entry.bank_id==bank_id,Transaction.kind=='unclaim',
+               Transaction.status=='confirmed',Transaction.created_at<end_utc)).scalar()
+    assigned=db.session.execute(select(func.coalesce(func.sum(UnclaimAllocation.amount),0))
+        .where(UnclaimAllocation.bank_id==bank_id,UnclaimAllocation.created_at<end_utc)).scalar()
+    return money(credited)-money(assigned)
+
+def operating_balance_at_utc(bank_id,end_utc):
+    return ledger_balance_at_utc(bank_id,end_utc)-pending_unclaim_at_utc(bank_id,end_utc)
+
+def utc_report_bounds(day):
+    """Wall-clock policy closing boundaries for the selected local report day."""
+    policy=db.session.get(ClosingPolicy,1)
+    if policy is None: raise ValueError('Configure Business Timezone first')
+    tz=effective_timezone(policy.auto_timezone,policy.manual_offset_minutes)
+    target=datetime.combine(day,datetime.min.time(),tzinfo=tz).astimezone(timezone.utc)
+    start=next_boundary(target-timedelta(days=3),policy.closing_hour,policy.closing_minute,policy.auto_timezone,policy.manual_offset_minutes)
+    while start.astimezone(tz).date()<day:
+        start=next_boundary(start,policy.closing_hour,policy.closing_minute,policy.auto_timezone,policy.manual_offset_minutes)
+    if start.astimezone(tz).date()!=day: raise ValueError('Report date has no closing boundary')
+    end=next_boundary(start,policy.closing_hour,policy.closing_minute,policy.auto_timezone,policy.manual_offset_minutes)
+    return start,end
+
 def ledger_balance(bank_id,through=None):
     q=select(func.coalesce(func.sum(Entry.delta),0)).where(Entry.bank_id==bank_id).join(Transaction,Entry.transaction_id==Transaction.id).where(Transaction.status=='confirmed')
     if through is not None: q=q.where(Transaction.business_date<=through)
@@ -449,7 +561,7 @@ def validate_entry_business_day(value):
     try: chosen=date.fromisoformat(str(value))
     except (TypeError,ValueError): raise ValueError('Invalid business date')
     if chosen not in (today,today-timedelta(days=1)):
-        raise ValueError('Transaction date must be today or yesterday (Malaysia time)')
+        raise ValueError('Transaction date must be today or yesterday (Melbourne time)')
     return chosen
 
 
@@ -584,12 +696,15 @@ def lock_banks(ids):
     return db.session.execute(select(Bank).where(Bank.id.in_(sorted(set(ids)))).order_by(Bank.id).with_for_update()).scalars().all()
 
 def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_bank_id=None,platform_id=None,business_day=None):
-    if not reference.strip(): raise ValueError('Transaction ID required')
-    if kind not in ('deposit','withdrawal','transfer'): raise ValueError('Unsupported type')
+    # Legacy internal transfers use the same double-entry ledger as ordinary bank transfers.
+    if kind=='internal_transfer': kind='transfer'
+    reference=(reference or '').strip() if kind in ('deposit','withdrawal') else 'BF-'+uuid.uuid4().hex[:20].upper()
+    if not reference: raise ValueError('Customer transaction ID required')
+    if kind not in ('deposit','withdrawal','transfer','cash_in','cash_out','unclaim','internal_transfer'): raise ValueError('Unsupported type')
     if not platform_id: raise ValueError("Select platform")
     a=amount_positive(amount); ids=[bank_id]+([to_bank_id] if to_bank_id else [])
-    if kind=='transfer' and (not to_bank_id or to_bank_id==bank_id): raise ValueError('Choose two different banks')
-    if kind!='transfer' and to_bank_id: raise ValueError('Unexpected destination bank')
+    if kind in ('transfer','internal_transfer') and (not to_bank_id or to_bank_id==bank_id): raise ValueError('Choose two different banks')
+    if kind not in ('transfer','internal_transfer') and to_bank_id: raise ValueError('Unexpected destination bank')
     day=validate_entry_business_day(business_day)
     try:
         bs=lock_banks(ids)
@@ -600,19 +715,23 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
             is_source = b.id == bank_id
             if b.status == 'active':
                 continue
-            if b.status == 'cannot_transfer' and not is_source and kind == 'transfer':
+            if b.status == 'cannot_transfer' and not is_source and kind in ('transfer','internal_transfer'):
                 continue
-            if b.status == 'cannot_transfer' and is_source and kind == 'deposit':
+            if b.status == 'cannot_transfer' and is_source and kind in ('deposit','cash_in','unclaim'):
                 continue
             raise ValueError(f'Bank {b.name} status is {BANK_STATUSES.get(b.status,b.status)}; this transaction is not permitted')
         check_open_day(day,ids)
+        for bid in ids:
+            last=ClosingPeriod.query.filter_by(bank_id=bid,status='closed').order_by(ClosingPeriod.end_utc.desc()).first()
+            if last and now() < (last.end_utc if last.end_utc.tzinfo else last.end_utc.replace(tzinfo=timezone.utc)):
+                raise ValueError('Transaction timestamp precedes last finalized closing boundary')
         if Transaction.query.filter_by(reference=reference.strip()).first(): raise ValueError('Duplicate Transaction ID')
-        delta=a if kind=='deposit' else -a
+        delta=a if kind in ('deposit','cash_in','unclaim') else -a
         if delta<0 and ledger_balance(bank_id)<a: raise ValueError('Insufficient balance (negative balances blocked for new debits)')
         t=Transaction(platform_id=platform_id,reference=reference.strip(),kind=kind,signed_amount=delta,customer_ref=customer_ref.strip() or None,remark=remark.strip(),created_by=user_id,business_date=day)
         db.session.add(t);db.session.flush()
         db.session.add(Entry(transaction_id=t.id,bank_id=bank_id,delta=delta))
-        if kind=='transfer': db.session.add(Entry(transaction_id=t.id,bank_id=to_bank_id,delta=a))
+        if kind in ('transfer','internal_transfer'): db.session.add(Entry(transaction_id=t.id,bank_id=to_bank_id,delta=a))
         db.session.flush()
         write_transaction_audit(t,user_id,'CREATE',after=transaction_snapshot(t))
         db.session.add(Audit(actor_id=user_id,action='CREATE_TRANSACTION',detail=f'{t.id} {kind} {reference}'))
@@ -621,12 +740,43 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
     except Exception:
         db.session.rollback();raise
 
+def record_deposit_back(withdraw_reference, deposit_reference, amount, user_id,
+                        customer_ref='', remark='', platform_id=None, business_day=None):
+    """Two counted customer movements, one atomic posting, zero net bank balance."""
+    if not platform_id: raise ValueError('Select platform')
+    wr=(withdraw_reference or '').strip(); dr=(deposit_reference or '').strip()
+    if not wr or not dr: raise ValueError('Both Withdrawal and Deposit Transaction IDs are required')
+    if wr==dr: raise ValueError('Withdrawal and Deposit Transaction IDs must be different')
+    if len(wr)>120 or len(dr)>120: raise ValueError('Transaction ID too long')
+    a=amount_positive(amount); day=validate_entry_business_day(business_day)
+    try:
+        # Internal re-deposit never touches a real bank or the Closing Engine ledger.
+        # Business-day validation still applies; no bank can be selected or debited.
+        if db.session.execute(select(Transaction.id).where(Transaction.reference.in_([wr,dr])).limit(1)).first():
+            raise ValueError('Duplicate Transaction ID')
+        group='DEPOSIT_BACK:'+uuid.uuid4().hex.upper()
+        note=(remark or '').strip()[:1500]
+        pair=[]
+        for kind,ref,delta in (('withdrawal',wr,-a),('deposit',dr,a)):
+            tx=Transaction(platform_id=platform_id,reference=ref,kind=kind,signed_amount=delta,
+                customer_ref=(customer_ref or '').strip() or None,
+                remark=f'[{group}] Internal re-deposit (no external bank movement). {note}',
+                created_by=user_id,business_date=day)
+            db.session.add(tx);db.session.flush()
+            write_transaction_audit(tx,user_id,'CREATE',after=transaction_snapshot(tx))
+            db.session.add(Audit(actor_id=user_id,action='CREATE_DEPOSIT_BACK',detail=f'{group} {tx.id} {kind} {ref} AUD={a}'))
+            pair.append(tx)
+        db.session.commit()
+        return pair
+    except Exception:
+        db.session.rollback();raise
+
 def record_dealer(kind, reference, amount, bank_id, user_id, dealer_id, rate, customer_ref='', remark='',platform_id=None,business_day=None):
     if not platform_id: raise ValueError('Select platform')
     if kind not in ('dealer_sell','dealer_buy','dealer_payout'):
         raise ValueError('Unsupported dealer transaction')
-    reference=reference.strip()
-    if not reference: raise ValueError('Transaction ID required')
+    reference=(reference or '').strip() if kind=='dealer_payout' else 'BF-'+uuid.uuid4().hex[:20].upper()
+    if not reference: raise ValueError('Customer transaction ID required')
     aud=amount_positive(amount)
     try: fx=Decimal(str(rate))
     except (InvalidOperation,TypeError): raise ValueError('Invalid exchange rate')
@@ -703,6 +853,9 @@ def create_app(test_config=None):
         if not username or len(password)<12:
             raise RuntimeError('Set ADMIN_USER and ADMIN_PASS (at least 12 characters)')
         db.create_all()
+        # Fail closed if PostgreSQL cannot install immutable financial-record guards.
+        from release_guards import install_postgres_guards
+        install_postgres_guards(db)
         initialize_bank_encryption_key()
         if not User.query.filter_by(role='admin').first():
             if User.query.filter_by(username=username).first():
@@ -740,27 +893,165 @@ def create_app(test_config=None):
     @app.route('/admin/timezone',methods=['GET','POST'])
     @role_required('admin')
     def manage_timezone():
+        policy=db.session.get(ClosingPolicy,1)
+        if not policy:
+            policy=ClosingPolicy(id=1,auto_timezone=True,manual_offset_minutes=600,closing_hour=0,closing_minute=0)
+            db.session.add(policy);db.session.commit()
         if request.method=='POST':
-            raw=request.form.get('offset_minutes','')
             try:
-                minutes=int(raw)
-                if minutes < -720 or minutes > 840 or minutes%30!=0:
-                    raise ValueError('Select a valid GMT offset')
-                previous=timezone_at()
-                if previous.utcoffset(now())==timedelta(minutes=minutes):
-                    flash('Timezone is already selected','info')
-                else:
-                    change=BusinessTimezoneChange(offset_minutes=minutes,actor_id=current_user.id,effective_at=now())
-                    db.session.add(change)
-                    db.session.add(Audit(actor_id=current_user.id,action='CHANGE_TIMEZONE',detail=f'GMT offset changed to {minutes:+d} minutes; effective from {change.effective_at.isoformat()} UTC; older timestamps unchanged'))
-                    db.session.commit()
-                    flash('New GMT offset applied to future activity; existing transaction dates and timestamps are unchanged','success')
+                mode=request.form.get('auto_timezone','active')
+                if mode not in ('active','inactive'):raise ValueError('Invalid timezone mode')
+                minutes=int(request.form.get('offset_minutes',str(policy.manual_offset_minutes)))
+                hour=int(request.form.get('closing_hour','0'))
+                minute=int(request.form.get('closing_minute','0'))
+                effective_timezone(mode=='active',minutes)
+                if not 0<=hour<24 or not 0<=minute<60:raise ValueError('Invalid closing time')
+                old=f'auto={policy.auto_timezone},offset={policy.manual_offset_minutes},clock={policy.closing_hour:02d}:{policy.closing_minute:02d}'
+                policy.auto_timezone=(mode=='active');policy.manual_offset_minutes=minutes
+                policy.closing_hour=hour;policy.closing_minute=minute
+                policy.updated_at=now();policy.updated_by=current_user.id
+                db.session.add(Audit(actor_id=current_user.id,action='UPDATE_CLOSING_POLICY',detail=f'{old} -> auto={policy.auto_timezone},offset={minutes},clock={hour:02d}:{minute:02d}; existing periods unchanged'))
+                db.session.commit();flash('Future closing policy updated. Existing closed periods are unchanged.','success')
             except (ValueError,TypeError) as e:
                 db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('manage_timezone'))
-        current=timezone_at()
         history=BusinessTimezoneChange.query.order_by(BusinessTimezoneChange.effective_at.desc()).limit(30).all()
-        return render_template('timezone_settings.html',offset_minutes=int(current.utcoffset(now()).total_seconds()//60),history=history)
+        return render_template('timezone_settings.html',offset_minutes=policy.manual_offset_minutes,history=history,policy=policy)
+
+    @app.get('/admin/clear-platform')
+    @role_required('admin')
+    def clear_platform_settings():
+        platforms=Platform.query.order_by(Platform.name).all()
+        proof=(PlatformResetBackupProof.query.filter_by(admin_id=current_user.id,used=False)
+            .filter(PlatformResetBackupProof.expires_at>now())
+            .order_by(PlatformResetBackupProof.created_at.desc()).first())
+        token=request.cookies.get('bankflow_reset_token','')
+        if not (proof and token and secrets.compare_digest(
+                proof.nonce_hash,hashlib.sha256(token.encode()).hexdigest())):
+            proof=None
+        return render_template('clear_platform.html',platforms=platforms,
+            backup_ready=bool(proof),backup_proof=proof)
+
+    @app.post('/admin/clear-platform/backup')
+    @role_required('admin')
+    def clear_platform_backup():
+        # Never accept 'all', and never infer a platform from a stale browser selection.
+        pid=request.form.get('platform_id','')
+        platform=db.session.get(Platform,pid)
+        if not platform or pid=='all': abort(400)
+        if db.engine.dialect.name!='postgresql':
+            flash('Backup requires PostgreSQL; reset disabled.','danger')
+            return redirect(url_for('clear_platform_settings'))
+        binary=shutil.which('pg_dump')
+        if not binary:
+            flash('pg_dump is not installed on this server. Create a PostgreSQL backup externally before enabling reset.','danger')
+            return redirect(url_for('clear_platform_settings'))
+        # A full database backup is intentional: foreign-key relationships and global settings matter.
+        # Never log credentials or return pg_dump stderr (which could include connection details).
+        fd,path=tempfile.mkstemp(prefix='bankflow_backup_',suffix='.dump')
+        os.close(fd)
+        try:
+            url=db.engine.url
+            env=os.environ.copy()
+            if url.password: env['PGPASSWORD']=url.password
+            cmd=[binary,'--format=custom','--no-owner','--no-acl','--file',path,
+                '--host',url.host or 'localhost','--port',str(url.port or 5432),
+                '--username',url.username or '',url.database or '']
+            result=subprocess.run(cmd,env=env,capture_output=True,timeout=180,check=False)
+            if result.returncode!=0 or os.path.getsize(path)<100:
+                raise RuntimeError('PostgreSQL backup failed; nothing was cleared')
+            with open(path,'rb') as f:
+                if f.read(5)!=b'PGDMP':raise RuntimeError('Invalid PostgreSQL custom-format backup')
+            # Persist proof in PostgreSQL so all Gunicorn workers see the same state.
+            # This confirms successful generation, NOT that the browser saved or restored it.
+            token=secrets.token_urlsafe(32)
+            db.session.execute(delete(PlatformResetBackupProof).where(
+                PlatformResetBackupProof.admin_id==current_user.id))
+            proof=PlatformResetBackupProof(admin_id=current_user.id,platform_id=pid,
+                nonce_hash=hashlib.sha256(token.encode()).hexdigest(),
+                expires_at=now()+timedelta(minutes=15))
+            db.session.add(proof)
+            db.session.commit()
+            response=send_file(path,as_attachment=True,download_name='bankflow_full_backup_'+now().strftime('%Y%m%d_%H%M%S')+'.dump',mimetype='application/octet-stream')
+            # Set an HttpOnly cookie on the download response; no cross-worker memory state.
+            response.set_cookie('bankflow_reset_token',token,max_age=900,httponly=True,
+                secure=app.config['SESSION_COOKIE_SECURE'],samesite='Lax',path='/admin/clear-platform')
+            @response.call_on_close
+            def cleanup():
+                try:os.remove(path)
+                except OSError:pass
+            return response
+        except (OSError,RuntimeError,subprocess.TimeoutExpired):
+            try:os.remove(path)
+            except OSError:pass
+            db.session.rollback()
+            flash('Database backup could not be generated. Reset remains disabled.','danger')
+            return redirect(url_for('clear_platform_settings'))
+
+    @app.post('/admin/clear-platform/execute')
+    @role_required('admin')
+    def clear_platform_execute():
+        pid=request.form.get('platform_id','')
+        platform=db.session.get(Platform,pid)
+        if not platform or pid=='all':abort(400)
+        token=request.cookies.get('bankflow_reset_token','')
+        proof=(PlatformResetBackupProof.query.filter_by(admin_id=current_user.id,
+            platform_id=pid,used=False).filter(PlatformResetBackupProof.expires_at>now())
+            .order_by(PlatformResetBackupProof.created_at.desc()).first())
+        if (not token or not proof or
+                not secrets.compare_digest(proof.nonce_hash,hashlib.sha256(token.encode()).hexdigest()) or
+                request.form.get('backup_proof_id','')!=proof.id):
+            abort(400,description='Generate a fresh backup for this platform first')
+        if request.form.get('confirm_text','')!='CLEAR ALL DATA':
+            flash('Confirmation text must be exactly CLEAR ALL DATA','danger')
+            return redirect(url_for('clear_platform_settings'))
+        if not check_password_hash(current_user.password_hash,request.form.get('password','')):
+            flash('Incorrect administrator password.','danger')
+            return redirect(url_for('clear_platform_settings'))
+        if request.form.get('backup_saved')!='yes':
+            flash('Confirm that the downloaded backup is saved before clearing.','danger')
+            return redirect(url_for('clear_platform_settings'))
+        # The reset is a single transaction; all deletes are scoped to explicit platform IDs.
+        # Database-level immutable financial triggers recognize the reset transaction flag.
+        try:
+            with db.session.begin_nested():
+                if db.engine.dialect.name=='postgresql':
+                    db.session.execute(text("SELECT set_config('bankflow.allow_platform_reset', 'true', true)"))
+                bank_ids=select(Bank.id).where(Bank.platform_id==pid)
+                tx_ids=select(Transaction.id).where(Transaction.platform_id==pid)
+                dealer_ids=select(Dealer.id).where(Dealer.platform_id==pid)
+                period_ids=select(ClosingPeriod.id).where(ClosingPeriod.bank_id.in_(bank_ids))
+                status_ids=select(BankStatusHistory.id).where(BankStatusHistory.bank_id.in_(bank_ids))
+                # Delete leaf rows before their parents; never touch global users/configuration.
+                db.session.execute(delete(TransactionAudit).where(TransactionAudit.platform_id==pid))
+                db.session.execute(delete(OperatingClosingSnapshot).where(OperatingClosingSnapshot.closing_period_id.in_(period_ids)))
+                db.session.execute(delete(ClosingFinancialSnapshot).where(ClosingFinancialSnapshot.closing_period_id.in_(period_ids)))
+                db.session.execute(delete(ClosingPeriod).where(ClosingPeriod.bank_id.in_(bank_ids)))
+                db.session.execute(delete(Closing).where(Closing.bank_id.in_(bank_ids)))
+                db.session.execute(delete(BlockedUnclaimedSettlement).where(BlockedUnclaimedSettlement.platform_id==pid))
+                db.session.execute(delete(BankStatusHistory).where(BankStatusHistory.bank_id.in_(bank_ids)))
+                db.session.execute(delete(UnclaimAllocation).where(UnclaimAllocation.platform_id==pid))
+                db.session.execute(delete(UnclaimedDeposit).where(UnclaimedDeposit.platform_id==pid))
+                db.session.execute(delete(DealerTrade).where(DealerTrade.transaction_id.in_(tx_ids)))
+                db.session.execute(delete(Entry).where(Entry.transaction_id.in_(tx_ids)))
+                db.session.execute(delete(Transaction).where(Transaction.platform_id==pid))
+                db.session.execute(delete(BankLabelAssignment).where(BankLabelAssignment.bank_id.in_(bank_ids)))
+                db.session.execute(delete(BankDetail).where(BankDetail.bank_id.in_(bank_ids)))
+                db.session.execute(delete(Bank).where(Bank.platform_id==pid))
+                db.session.execute(delete(BankLabel).where(BankLabel.platform_id==pid))
+                db.session.execute(delete(Dealer).where(Dealer.platform_id==pid))
+                proof.used=True
+                db.session.add(Audit(actor_id=current_user.id,action='CLEAR_PLATFORM_DATA',
+                    detail=f'platform_id={pid} platform_name={platform.name} reset performed after pg_dump generation and administrator backup confirmation'))
+            db.session.commit()
+            flash(f'Platform {platform.name}: business data cleared. Platform, accounts and settings retained.','success')
+        except Exception:
+            db.session.rollback()
+            flash('Reset failed; database transaction rolled back. No partial reset was committed.','danger')
+        response=redirect(url_for('clear_platform_settings'))
+        if not db.session.get(PlatformResetBackupProof,proof.id) or db.session.get(PlatformResetBackupProof,proof.id).used:
+            response.delete_cookie('bankflow_reset_token',path='/admin/clear-platform')
+        return response
 
     @app.route('/admin/platforms',methods=['GET','POST'])
     @role_required('admin')
@@ -861,6 +1152,45 @@ def create_app(test_config=None):
     @login_required
     def logout(): logout_user();session.pop('platform_id',None);return redirect(url_for('login'))
 
+    def dashboard_utc_window(start_day, end_day):
+        """Business-day labels refer to the local interval starting at closing time.
+
+        E.g. Melbourne 00:00 on Oct 20 labels the interval Oct 20 00:00
+        through Oct 21 00:00. Current-day reports stop at the current instant.
+        Historical closing snapshots are only matched on their exact UTC boundary.
+        """
+        policy = db.session.get(ClosingPolicy, 1)
+        auto = policy.auto_timezone if policy else True
+        offset = policy.manual_offset_minutes if policy else 600
+        hour = policy.closing_hour if policy else 0
+        minute = policy.closing_minute if policy else 0
+        zone = effective_timezone(auto, offset)
+
+        def boundary(d):
+            # Choose the first valid occurrence on the specified local date.
+            # For a DST gap, use the first real time after the gap.
+            candidates = []
+            for fold in (0, 1):
+                local = datetime.combine(d, time(hour, minute)).replace(tzinfo=zone, fold=fold)
+                instant = local.astimezone(timezone.utc)
+                if instant.astimezone(zone).replace(tzinfo=None) == local.replace(tzinfo=None):
+                    candidates.append(instant)
+            if candidates:
+                return min(candidates)
+            # A nonexistent clock time on DST spring-forward day: use the
+            # earliest next valid boundary (not an imaginary local instant).
+            probe = datetime.combine(d, time(0, 0), tzinfo=zone).astimezone(timezone.utc) - timedelta(seconds=1)
+            return next_boundary(probe, hour, minute, auto, offset)
+
+        start = boundary(start_day)
+        end = boundary(end_day + timedelta(days=1))
+        # When today's configured closing hour has not yet arrived, the
+        # currently open business period began at yesterday's closing.
+        if start_day == end_day == business_today() and start > now():
+            start = boundary(start_day - timedelta(days=1))
+            end = boundary(start_day)
+        return start, end
+
     @app.get('/')
     @login_required
     def dashboard():
@@ -874,29 +1204,138 @@ def create_app(test_config=None):
         history_by_bank = {}
         for h in history:
             history_by_bank.setdefault(h.bank_id, []).append(h)
-        day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=timezone_for_report_day(day)).astimezone(timezone.utc)
-        existing = [b for b in all_banks if b.created_at is None or b.created_at.astimezone(timezone.utc) < day_end]
-        statuses = {b.id: bank_status_on(b, day, history_by_bank) for b in existing}
-        bal = balances_through(day)
+        range_start_utc, scheduled_end_utc = dashboard_utc_window(start_day, day)
+        # Never include future transactions in a live (unfinished) period.
+        range_end_utc = min(scheduled_end_utc, now())
+        if range_end_utc <= range_start_utc:
+            # The selected business-day period has not started yet.
+            range_end_utc = range_start_utc
+        day_end = range_end_utc
+        existing = [b for b in all_banks if b.created_at is None or _utc_db(b.created_at) < day_end]
+        statuses = {b.id: (b.status if day == business_today() else bank_status_on(b, day, history_by_bank)) for b in existing}
+        period_stats = (utc_bank_overview(db, Bank, Entry, Transaction, existing, range_start_utc, range_end_utc)
+                        if range_end_utc > range_start_utc else {})
+        if not period_stats:
+            period_stats = {b.id: dict(opening=money(b.opening_balance),in_amount=Decimal('0'),out_amount=Decimal('0'),in_count=0,out_count=0,day_close=money(b.opening_balance)) for b in existing}
+        # Use immutable snapshots only for a matching single completed period.
+        # A snapshot cannot safely be reused for a multi-day range or different UTC bounds.
+        historical_snapshot_ids = set()
+        historical_unclaimed_missing = set()
+        if start_day == day and scheduled_end_utc <= now() and existing:
+            periods = db.session.execute(select(ClosingPeriod, ClosingFinancialSnapshot)
+                .join(ClosingFinancialSnapshot, ClosingFinancialSnapshot.closing_period_id == ClosingPeriod.id)
+                .where(ClosingPeriod.bank_id.in_([b.id for b in existing]), ClosingPeriod.status == 'closed',
+                       ClosingPeriod.start_utc == range_start_utc, ClosingPeriod.end_utc == scheduled_end_utc)).all()
+            for period, snapshot in periods:
+                period_stats[period.bank_id] = dict(
+                    opening=money(snapshot.opening), in_amount=money(snapshot.incoming),
+                    out_amount=money(snapshot.outgoing),
+                    in_count=period_stats[period.bank_id]['in_count'],
+                    out_count=period_stats[period.bank_id]['out_count'],
+                    day_close=money(snapshot.closing_balance))
+                historical_snapshot_ids.add(period.bank_id)
+        # V7.9.6.35: Posted Unclaim is a distinct dashboard category, not IN.
+        # The ledger entry remains a genuine credit; presentation reclassifies
+        # that credit rather than posting it a second time.
+        posted_unclaim = {b.id: Decimal('0.00') for b in existing}
+        if existing and range_end_utc > range_start_utc:
+            unclaim_rows = db.session.execute(
+                select(Entry.bank_id, func.coalesce(func.sum(Entry.delta), 0), func.count(Entry.id))
+                .join(Transaction, Entry.transaction_id == Transaction.id)
+                .where(Entry.bank_id.in_([b.id for b in existing]),
+                       Transaction.kind == 'unclaim', Transaction.status == 'confirmed',
+                       Transaction.created_at >= range_start_utc,
+                       Transaction.created_at < range_end_utc)
+                .group_by(Entry.bank_id)).all()
+            for bank_id, amount, count in unclaim_rows:
+                posted_unclaim[bank_id] = money(amount)
+                period_stats[bank_id]['in_amount'] = money(period_stats[bank_id]['in_amount']) - money(amount)
+                period_stats[bank_id]['in_count'] = max(0, int(period_stats[bank_id]['in_count']) - int(count))
+        # Operating opening excludes cumulative unallocated Unclaim from prior days.
+        pending_open={b.id:pending_unclaim_at_utc(b.id,range_start_utc) for b in existing}
+        pending_close={b.id:pending_unclaim_at_utc(b.id,range_end_utc) for b in existing}
+        for bank in existing:
+            stats=period_stats[bank.id]
+            stats['opening']=money(stats['opening'])-pending_open[bank.id]
+            stats['day_close']=money(stats['day_close'])-pending_close[bank.id]
+        allocation_rows=db.session.execute(select(UnclaimAllocation.bank_id,
+            func.coalesce(func.sum(UnclaimAllocation.amount),0),func.count(UnclaimAllocation.id))
+            .where(UnclaimAllocation.bank_id.in_([b.id for b in existing]),
+                   UnclaimAllocation.created_at>=range_start_utc,
+                   UnclaimAllocation.created_at<range_end_utc)
+            .group_by(UnclaimAllocation.bank_id)).all() if existing else []
+        for bank_id, amount, count in allocation_rows:
+            period_stats[bank_id]['in_amount']=money(period_stats[bank_id]['in_amount'])+money(amount)
+            period_stats[bank_id]['in_count']+=count
+        bal = {b.id: period_stats[b.id]['day_close'] for b in existing}
         unclaimed_components = unclaimed_balance_components([b.id for b in existing], day)
-        display_bal = {b.id: bal[b.id] + unclaimed_components.get(b.id, Decimal('0.00')) for b in existing}
+        if day < business_today():
+            # Current mutable lead statuses must not masquerade as historical balances.
+            unclaimed_components = {b.id: Decimal('0') for b in existing}
+            historical_unclaimed_missing = {b.id for b in existing}
+            if start_day == day and historical_snapshot_ids:
+                snapshot_rows = db.session.execute(select(ClosingFinancialSnapshot)
+                    .join(ClosingPeriod, ClosingFinancialSnapshot.closing_period_id == ClosingPeriod.id)
+                    .where(ClosingPeriod.bank_id.in_(list(historical_snapshot_ids)),
+                           ClosingPeriod.start_utc == range_start_utc,
+                           ClosingPeriod.end_utc == scheduled_end_utc)).scalars().all()
+                for snap in snapshot_rows:
+                    unclaimed_components[snap.bank_id] = money(snap.unclaimed_amount)
+                    historical_unclaimed_missing.discard(snap.bank_id)
+        # Dashboard columns: Before Unclaimed + Unclaimed = With Unclaimed.
+        # Only the selected period's posted Unclaim is moved out of IN and
+        # into Unclaimed; earlier posted Unclaims remain in the opening balance.
+        before_unclaim = {b.id: bal[b.id] for b in existing}
+        unclaimed_components = {b.id: pending_close[b.id] for b in existing}
+        display_bal = {b.id: before_unclaim[b.id] + unclaimed_components[b.id] for b in existing}
         # "Bank Block" means status=closed; other issues remain in the closing total.
         blocked = [b for b in existing if statuses[b.id] == 'closed']
         active_banks = [b for b in existing if statuses[b.id] == 'active']
-        dashboard_bank_stats = bank_daily_overview(active_banks, day)
+        # Bank balance tabs use existing bank groups and statuses only.
+        category_labels = []
+        bank_category_ids = {b.id: set() for b in existing}
+        available_bank_groups = sorted({b.kind for b in existing if b.kind})
+        selected_bank_groups = [g for g in available_bank_groups if g in request.args.getlist('bank_group')]
+        selected_category = request.args.get('category', 'active')
+        allowed_categories = {'active', 'all', 'problem', 'group:deposit', 'group:withdrawal', 'group:store', 'group:other'}
+        if selected_category not in allowed_categories:
+            selected_category = 'active'
+        problem_statuses = set(BANK_STATUSES) - {'active', 'closed'}
+        if selected_category == 'active':
+            category_banks = active_banks
+        elif selected_category == 'all':
+            category_banks = existing
+        elif selected_category == 'problem':
+            # Operational problem queue always reflects CURRENT status, even when viewing historical balances.
+            category_banks = [b for b in existing if b.status not in ('active', 'closed')]
+        elif selected_category.startswith('group:'):
+            category_banks = [b for b in existing if b.kind == selected_category.split(':', 1)[1]]
+        else:
+            category_banks = active_banks
+        filtered_active_banks = ([b for b in category_banks if b.kind in selected_bank_groups]
+                                 if selected_bank_groups else category_banks)
+        dashboard_bank_stats = {b.id: type('PeriodStats', (), period_stats[b.id])() for b in existing}
         closing_total = sum((bal[b.id] for b in existing if statuses[b.id] != 'closed'), Decimal('0'))
         active_total = sum((bal[b.id] for b in active_banks), Decimal('0'))
-        start = (bank_page - 1) * 10
-        bank_items = active_banks[start:start + 10]
-        bank_pages = max(1, (len(active_banks) + 9) // 10)
+        bank_pages = max(1, (len(filtered_active_banks) + 9) // 10)
         bank_page = min(bank_page, bank_pages)
-        bank_items = active_banks[(bank_page-1)*10:bank_page*10]
+        bank_items = filtered_active_banks[(bank_page-1)*10:bank_page*10]
         rows = db.session.execute(
             select(Transaction.kind, func.count(Transaction.id), func.coalesce(func.sum(Transaction.signed_amount), 0))
-            .where(Transaction.business_date.between(start_day, day), Transaction.status == 'confirmed',platform_scope(Transaction))
+            .where(Transaction.created_at >= range_start_utc, Transaction.created_at < range_end_utc, Transaction.status == 'confirmed',platform_scope(Transaction))
             .group_by(Transaction.kind)).all()
         totals = {k: {'count': n, 'amount': money(v)} for k, n, v in rows}
-        latest = (Transaction.query.filter(Transaction.business_date.between(start_day, day),platform_scope(Transaction))
+        # Allocations count as Customer Deposits on the allocation date, without a bank entry.
+        allocation_count=sum(int(r[2]) for r in allocation_rows)
+        allocation_amount=sum((money(r[1]) for r in allocation_rows),Decimal('0'))
+        if allocation_count:
+            deposit_total=totals.setdefault('deposit',{'count':0,'amount':Decimal('0')})
+            deposit_total['count']+=allocation_count
+            deposit_total['amount']+=allocation_amount
+
+        # Dashboard retains its historical report-date filtering (V7.9.6.11 behavior).
+        latest = (Transaction.query.filter(Transaction.created_at >= range_start_utc,
+                                           Transaction.created_at < range_end_utc, platform_scope(Transaction))
                   .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
         platform_names = {p.id:p.name for p in Platform.query.filter(Platform.id.in_({t.platform_id for t in latest})).all()} if latest else {}
         void_audits = (TransactionAudit.query.filter(TransactionAudit.transaction_id.in_([t.id for t in latest]),TransactionAudit.action=='VOID').order_by(TransactionAudit.created_at.desc()).all() if latest else [])
@@ -917,12 +1356,12 @@ def create_app(test_config=None):
                 grouped.setdefault(tid, []).append((delta, name))
             for t in latest:
                 items = grouped.get(t.id, [])
-                if t.kind == 'transfer':
+                if t.kind in ('transfer','internal_transfer'):
                     source = next((name for delta, name in items if delta < 0), 'Unknown')
                     dest = next((name for delta, name in items if delta > 0), 'Unknown')
                     transaction_banks[t.id] = f'{source} → {dest}'
                 else:
-                    transaction_banks[t.id] = items[0][1] if items else ('Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
+                    transaction_banks[t.id] = items[0][1] if items else ('Internal · Deposit Back' if (t.remark or '').startswith('[DEPOSIT_BACK:') else 'Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
         closed_query = (Closing.query.filter(Closing.business_date.between(start_day, day),Closing.bank_id.in_([b.id for b in all_banks]))
                         .order_by(Closing.created_at.desc(), Closing.id.desc()))
         closed_page = closed_query.paginate(page=close_page, per_page=10, error_out=False)
@@ -936,21 +1375,21 @@ def create_app(test_config=None):
         normalized_id = func.lower(func.trim(Transaction.customer_ref))
         active_ids = set(db.session.execute(
             select(normalized_id).where(*activity_filter,
-                Transaction.business_date.between(start_day, day)).distinct()
+                Transaction.created_at >= range_start_utc, Transaction.created_at < range_end_utc).distinct()
         ).scalars().all())
         first_seen = db.session.execute(
-            select(normalized_id, func.min(Transaction.business_date))
+            select(normalized_id, func.min(Transaction.created_at))
             .where(*activity_filter).group_by(normalized_id)
         ).all()
         first_dates = dict(first_seen)
         new_count = sum(1 for customer_id in active_ids
-                        if start_day <= first_dates[customer_id] <= day)
+                        if range_start_utc <= first_dates[customer_id].replace(tzinfo=first_dates[customer_id].tzinfo or timezone.utc) < range_end_utc)
         dealer_items = Dealer.query.filter(platform_scope(Dealer)).order_by(Dealer.name).all()
         dealer_rows = db.session.execute(
             select(DealerTrade.dealer_id, DealerTrade.flow,
                    func.sum(DealerTrade.aud_amount), func.sum(DealerTrade.myr_delta))
             .join(Transaction, Transaction.id == DealerTrade.transaction_id)
-            .where(Transaction.status == 'confirmed',Transaction.business_date.between(start_day,day),platform_scope(Transaction))
+            .where(Transaction.status == 'confirmed',Transaction.created_at >= range_start_utc, Transaction.created_at < range_end_utc,platform_scope(Transaction))
             .group_by(DealerTrade.dealer_id, DealerTrade.flow)
         ).all()
         dealer_totals = {}
@@ -970,11 +1409,67 @@ def create_app(test_config=None):
             page_with_unclaimed=sum((display_bal[b.id] for b in bank_items), Decimal('0')),
             active_with_unclaimed=sum((display_bal[b.id] for b in active_banks), Decimal('0')),
             total_unclaimed=sum((unclaimed_components.get(b.id, Decimal('0')) for b in active_banks), Decimal('0')),
-            ledger_balances=bal,
+            ledger_balances=before_unclaim,
+            historical_unclaimed_missing=historical_unclaimed_missing,
             bank_page=bank_page, bank_pages=bank_pages, active_count=len(active_banks),
+            available_bank_groups=available_bank_groups, selected_bank_groups=selected_bank_groups,
+            category_labels=category_labels, selected_category=selected_category, bank_category_ids=bank_category_ids,
+            bank_status_options=BANK_STATUSES, problem_statuses=problem_statuses,
+            filtered_bank_count=len(filtered_active_banks),
+            filtered_ledger_total=sum((before_unclaim[b.id] for b in filtered_active_banks), Decimal('0')),
+            filtered_unclaimed_total=sum((unclaimed_components.get(b.id, Decimal('0')) for b in filtered_active_banks), Decimal('0')),
+            filtered_with_unclaimed_total=sum((display_bal[b.id] for b in filtered_active_banks), Decimal('0')),
             block_count=len(blocked), block_banks=blocked, closing_total=closing_total,
             closed_banks=closed_page.items, closed_page=closed_page,
-            closed_count=closed_page.total, statuses=statuses)
+            closed_count=closed_page.total, statuses=statuses, range_start_utc=range_start_utc, range_end_utc=range_end_utc)
+
+    @app.post('/bank-categories/<label_id>/rename')
+    @login_required
+    def rename_bank_category(label_id):
+        require_permission('manage_bank_labels')
+        label=db.session.get(BankLabel,label_id)
+        if not label or label.platform_id!=require_single_platform(): abort(404)
+        name=request.form.get('name','').strip()[:60]
+        if not name: abort(400)
+        old=label.name
+        try:
+            label.name=name
+            db.session.add(Audit(actor_id=current_user.id,action='RENAME_BANK_CATEGORY',detail=f'{label.id}: {old} -> {name}'))
+            db.session.commit();flash('Category renamed','success')
+        except IntegrityError:
+            db.session.rollback();flash('Category name already exists','warning')
+        return redirect(url_for('dashboard',category=label.id))
+
+    @app.post('/bank-categories/<label_id>/delete')
+    @login_required
+    def delete_bank_category(label_id):
+        require_permission('manage_bank_labels')
+        label=db.session.get(BankLabel,label_id)
+        if not label or label.platform_id!=require_single_platform(): abort(404)
+        if BankLabelAssignment.query.filter_by(label_id=label.id).first():
+            flash('Category is assigned to banks. Unassign banks before deleting.','warning')
+            return redirect(url_for('dashboard',category=label.id))
+        db.session.add(Audit(actor_id=current_user.id,action='DELETE_BANK_CATEGORY',detail=f'{label.id} {label.name}'))
+        db.session.delete(label);db.session.commit();flash('Category deleted','success')
+        return redirect(url_for('dashboard'))
+
+    @app.post('/banks/<bank_id>/categories')
+    @login_required
+    def update_bank_categories(bank_id):
+        require_permission('manage_bank_labels')
+        pid=require_single_platform()
+        bank_for_platform(bank_id,pid)
+        chosen=set(request.form.getlist('label_ids'))
+        allowed={x.id for x in BankLabel.query.filter_by(platform_id=pid).all()}
+        if not chosen.issubset(allowed): abort(400)
+        current={x.label_id for x in BankLabelAssignment.query.filter_by(bank_id=bank_id).all()}
+        for removed in current-chosen:
+            db.session.delete(db.session.get(BankLabelAssignment,(bank_id,removed)))
+        for added in chosen-current:
+            db.session.add(BankLabelAssignment(bank_id=bank_id,label_id=added))
+        db.session.add(Audit(actor_id=current_user.id,action='UPDATE_BANK_CATEGORIES',detail=f'{bank_id}: {sorted(current)} -> {sorted(chosen)}'))
+        db.session.commit();flash('Bank categories saved','success')
+        return redirect(url_for('dashboard',category=request.form.get('return_category','active')))
 
     @app.post('/bank-labels')
     @login_required
@@ -990,7 +1485,7 @@ def create_app(test_config=None):
             db.session.commit();flash('Bank tag created','success')
         except IntegrityError:
             db.session.rollback();flash('This tag already exists on this platform','warning')
-        return redirect(url_for('banks'))
+        return redirect(url_for('dashboard') if request.form.get('return_to')=='dashboard' else url_for('banks'))
 
     @app.post('/banks/<bank_id>/label')
     @login_required
@@ -1001,8 +1496,9 @@ def create_app(test_config=None):
         label_id=request.form.get('label_id','').strip()
         label=db.session.get(BankLabel,label_id) if label_id else None
         if label_id and (not label or label.platform_id!=pid):abort(403)
-        assignment=db.session.get(BankLabelAssignment,bank_id)
-        if assignment:db.session.delete(assignment);db.session.flush()
+        existing_assignments=BankLabelAssignment.query.filter_by(bank_id=bank_id).all()
+        for assignment in existing_assignments: db.session.delete(assignment)
+        db.session.flush()
         if label:db.session.add(BankLabelAssignment(bank_id=bank_id,label_id=label.id))
         db.session.add(Audit(actor_id=current_user.id,action='ASSIGN_BANK_LABEL',detail=f'{bank_id} label={label_id or "none"}'))
         db.session.commit();flash('Bank tag updated','success')
@@ -1019,12 +1515,17 @@ def create_app(test_config=None):
                 kind=request.form.get('kind','')
                 if not name or kind not in ('deposit','withdrawal','store','other'): raise ValueError('Invalid bank details')
                 pid=require_single_platform()
+                existing_bank=Bank.query.filter(Bank.platform_id==pid,func.lower(Bank.name)==name.lower()).first()
+                if existing_bank: raise ValueError(f'Bank \"{name}\" already exists in this platform.')
                 b=Bank(platform_id=pid,name=name,kind=kind,opening_balance=money(request.form.get('opening_balance','0')) if current_user.role=='admin' else Decimal('0'))
                 db.session.add(b);db.session.flush()
                 save_bank_detail(b,request.form)
                 db.session.add(Audit(actor_id=current_user.id,action='CREATE_BANK',detail=f'{b.id} {name}'))
                 db.session.commit();flash('Bank created','success')
-            except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
+            except ValueError as e:
+                db.session.rollback();flash(str(e),'danger')
+            except IntegrityError:
+                db.session.rollback();flash('Bank name already exists in this platform or conflicts with another record.','danger')
             return redirect(url_for('banks'))
         day=selected_date()
         bank_page=max(1,request.args.get('bank_page',1,type=int))
@@ -1036,6 +1537,10 @@ def create_app(test_config=None):
             bank_query=bank_query.join(BankLabelAssignment,BankLabelAssignment.bank_id==Bank.id).join(BankLabel,BankLabel.id==BankLabelAssignment.label_id).filter(BankLabel.id==label_filter, BankLabel.platform_id==Bank.platform_id)
         if status_filter in BANK_STATUSES:
             bank_query=bank_query.filter(Bank.status==status_filter)
+        else:
+            # Default operational list excludes closed banks. They remain
+            # discoverable with explicit status=closed and in historical reports.
+            bank_query=bank_query.filter(Bank.status!='closed')
         bank_pagination=bank_query.order_by(Bank.kind,Bank.name).paginate(page=bank_page,per_page=15,error_out=False)
         end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=timezone_for_report_day(day)).astimezone(timezone.utc)
         history_pagination=BankStatusHistory.query.filter(BankStatusHistory.created_at < end,BankStatusHistory.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=history_page,per_page=15,error_out=False)
@@ -1073,7 +1578,10 @@ def create_app(test_config=None):
             except InvalidToken: abort(500,'Unable to decrypt stored credential')
         db.session.add(Audit(actor_id=current_user.id,action='REVEAL_BANK_PASSWORD',detail=f'bank={bank.id}'))
         db.session.commit()
-        response=app.make_response(render_template('bank_password_reveal.html',bank=bank,password=password))
+        if request.accept_mimetypes.best == 'application/json':
+            response=app.json.response({'password':password or ''})
+        else:
+            response=app.make_response(render_template('bank_password_reveal.html',bank=bank,password=password))
         response.headers['Cache-Control']='no-store, private'
         return response
 
@@ -1081,26 +1589,39 @@ def create_app(test_config=None):
     @role_required('admin','staff')
     def update_bank_status(bank_id):
         bank_for_platform(bank_id,require_single_platform())
+        destination = request.form.get('return_to') if request.form.get('return_to') in ('dashboard','new_transaction') else 'banks'
+        def status_return():
+            if destination == 'new_transaction':
+                return redirect(url_for('new_transaction') + '#newtx-bank-balances')
+            if destination == 'dashboard':
+                return redirect(url_for('dashboard',start_date=request.form.get('start_date'),end_date=request.form.get('end_date'),category=request.form.get('category','active'),bank_group=request.form.getlist('bank_group')) + '#bank-balances')
+            return redirect(url_for('banks'))
         new_status=request.form.get('status','').strip()
         remark=request.form.get('remark','').strip()
         if new_status not in BANK_STATUSES:
             flash('Invalid bank status','danger')
-            return redirect(url_for('banks'))
+            return status_return()
         if len(remark)>2000:
             flash('Remark must be 2000 characters or fewer','danger')
-            return redirect(url_for('banks'))
+            return status_return()
         if new_status!='active' and not remark:
             flash('A reason is required when reporting a bank issue','danger')
-            return redirect(url_for('banks'))
+            return status_return()
         try:
             locked=lock_banks([bank_id])
             if len(locked)!=1: abort(404)
             bank=locked[0]
             old_status=bank.status
+            # Closed is terminal for ordinary status updates. A future reopen must
+            # be a separate, audited financial workflow with an explicit new anchor.
+            if old_status=='closed' and new_status!='closed':
+                db.session.rollback()
+                flash('Closed banks cannot be reactivated via Status. A separately verified reopen workflow is required.','danger')
+                return status_return()
             if old_status==new_status and (bank.status_remark or '')==remark:
                 db.session.rollback()
                 flash('No changes to save','info')
-                return redirect(url_for('banks'))
+                return status_return()
             bank.status=new_status
             bank.status_remark=remark or None
             bank.status_updated_at=now()
@@ -1116,13 +1637,15 @@ def create_app(test_config=None):
                 leads=(UnclaimedDeposit.query.filter_by(bank_id=bank.id,platform_id=bank.platform_id,status='unclaimed')
                        .order_by(UnclaimedDeposit.id).with_for_update().all())
                 ledger=ledger_balance(bank.id)
-                pending=sum((money(x.amount) for x in leads),Decimal('0.00'))
+                # Posted Unclaim is already in the actual ledger; pending is
+                # outstanding posted Unclaim less allocations, not investigation leads.
+                pending=pending_unclaim_at_utc(bank.id,now())
                 snapshot=[{'id':x.id,'reference':x.reference,'amount':str(money(x.amount)),
                            'created_at':x.created_at.isoformat() if x.created_at else None} for x in leads]
                 db.session.add(BlockedUnclaimedSettlement(
                     platform_id=bank.platform_id,bank_id=bank.id,status_history_id=status_event.id,
                     actor_id=current_user.id,ledger_balance=ledger,unclaimed_amount=pending,
-                    unclaimed_count=len(leads),with_unclaimed=ledger+pending,
+                    unclaimed_count=len(leads),with_unclaimed=ledger,
                     leads_json=json.dumps(snapshot,ensure_ascii=False),remark=remark or None))
                 db.session.add(Audit(actor_id=current_user.id,action='BLOCKED_UNCLAIMED_SNAPSHOT',
                     detail=f'bank={bank.id} leads={len(leads)} unclaimed={pending} ledger={ledger}'))
@@ -1133,7 +1656,7 @@ def create_app(test_config=None):
         except Exception:
             db.session.rollback()
             raise
-        return redirect(url_for('banks'))
+        return status_return()
 
     @app.get('/banks/<bank_id>/blocked-settlements')
     @login_required
@@ -1157,7 +1680,7 @@ def create_app(test_config=None):
                     db.session.add(Dealer(name=name,platform_id=pid));db.session.commit();flash('Dealer added','success')
                 except IntegrityError:
                     db.session.rollback();flash('Dealer already exists','danger')
-            return redirect(url_for('banks') + '#add-dealer')
+            return redirect(url_for('banks'))
         items=Dealer.query.filter(platform_scope(Dealer)).order_by(Dealer.name).all()
         rows=db.session.execute(select(DealerTrade.dealer_id,DealerTrade.flow,func.sum(DealerTrade.aud_amount),func.sum(DealerTrade.myr_delta)).join(Transaction,Transaction.id==DealerTrade.transaction_id).where(Transaction.status=='confirmed',platform_scope(Transaction)).group_by(DealerTrade.dealer_id,DealerTrade.flow)).all()
         totals={}
@@ -1165,6 +1688,27 @@ def create_app(test_config=None):
             d=totals.setdefault(did,{'dealer_sell':Decimal('0'),'dealer_buy':Decimal('0'),'dealer_payout':Decimal('0'),'myr':Decimal('0')})
             d[flow]+=aud;d['myr']+=myr
         return render_template('dealers.html',dealers=items,totals=totals)
+
+    @app.post('/transactions/check-reference')
+    @login_required
+    def check_transaction_reference():
+        # This is a preflight UX check only. The final POST still enforces uniqueness.
+        require_permission('create_transaction')
+        pid=require_single_platform()
+        kind=(request.form.get('kind') or '').strip()
+        reference=(request.form.get('reference') or '').strip()
+        if kind not in ('deposit','withdrawal','dealer_payout'):
+            return app.json.response({'ok':True,'duplicate':False})
+        if not reference:
+            response=app.json.response({'ok':False,'duplicate':False,'error':'Platform Transaction ID is required.'})
+            response.status_code=400
+            response.headers['Cache-Control']='no-store'
+            return response
+        # Match the existing global uniqueness rule used by record/record_dealer.
+        exists=db.session.execute(select(Transaction.id).where(Transaction.reference==reference).limit(1)).first() is not None
+        response=app.json.response({'ok':not exists,'duplicate':exists,'error':'Duplicate Transaction ID' if exists else ''})
+        response.headers['Cache-Control']='no-store'
+        return response
 
     @app.route('/transactions/new',methods=['GET','POST'])
     @login_required
@@ -1174,22 +1718,44 @@ def create_app(test_config=None):
             try:
                 chosen_day=validate_entry_business_day(request.form.get('business_date'))
                 kind=request.form.get('kind','')
-                if kind in ('dealer_sell','dealer_buy','dealer_payout'):
+                require_permission('create_transaction')
+                if kind == 'deposit_back':
+                    record_deposit_back(request.form.get('withdraw_reference',''),request.form.get('deposit_reference',''),request.form.get('amount',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),platform_id=pid,business_day=chosen_day)
+                elif kind in ('dealer_sell','dealer_buy','dealer_payout'):
                     record_dealer(kind,request.form.get('reference',''),request.form.get('amount',''),
                                   request.form.get('bank_id','') if kind!='dealer_payout' else None,
                                   current_user.id,request.form.get('dealer_id',''),request.form.get('rate',''),
                                   request.form.get('customer_ref',''),request.form.get('remark',''),platform_id=pid,business_day=chosen_day)
                 else:
-                    record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id',''),current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None,platform_id=pid,business_day=chosen_day)
+                    record(kind,request.form.get('reference',''),request.form.get('amount',''),request.form.get('bank_id') or None,current_user.id,request.form.get('customer_ref',''),request.form.get('remark',''),request.form.get('to_bank_id') or None,platform_id=pid,business_day=chosen_day)
+                if request.accept_mimetypes.best == 'application/json':
+                    response=app.json.response({'ok':True,'redirect':url_for('new_transaction')})
+                    response.headers['Cache-Control']='no-store'
+                    return response
                 flash('Transaction confirmed and balance updated','success');return redirect(url_for('new_transaction'))
-            except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
+            except (ValueError,IntegrityError) as e:
+                db.session.rollback()
+                if request.accept_mimetypes.best == 'application/json':
+                    message=str(e)
+                    duplicate=('duplicate' in message.lower() or ('unique' in message.lower() and 'reference' in message.lower()))
+                    response=app.json.response({'ok':False,'field':'reference' if duplicate else None,'error':'This platform Transaction ID already exists. Please enter a different ID.' if duplicate else message})
+                    response.status_code=409 if duplicate else 400
+                    response.headers['Cache-Control']='no-store'
+                    return response
+                message=str(e)
+                duplicate=('duplicate' in message.lower() or ('unique' in message.lower() and 'reference' in message.lower()))
+                if duplicate and (request.form.get('kind') or '') in ('deposit','withdrawal','dealer_payout'):
+                    # No redirect/flash: re-render below, restoring all inputs and opening the entry modal.
+                    g.duplicate_transaction_form_state={k:v for k,v in request.form.items() if k!='csrf_token'}
+                else:
+                    flash(message,'danger')
         
         balance_banks=[];balance_values={};bank_stats={};recent=[];recent_pagination=None
         if permitted('view_bank_balances'):
-            balance_banks=Bank.query.filter(platform_scope(Bank), Bank.status=='active', Bank.active==True).order_by(Bank.name).all()
+            balance_banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
             bank_stats=bank_daily_overview(balance_banks)
             balance_values={b.id:bank_stats[b.id]['current'] for b in balance_banks}
-            bank_ids=[b.id for b in balance_banks]
+            bank_ids=[b.id for b in balance_banks if b.status=='active' and b.active]
             if permitted('view_bank_movements') and bank_ids:
                 movement_search=request.args.get('movement_search','').strip()[:120]
                 movement_bank=request.args.get('movement_bank','').strip()[:36]
@@ -1203,14 +1769,28 @@ def create_app(test_config=None):
                 if movement_search:
                     pattern=f'%{movement_search}%'
                     movement_query=movement_query.where(db.or_(Transaction.reference.ilike(pattern),Transaction.customer_ref.ilike(pattern),Bank.name.ilike(pattern)))
-                movement_count=db.session.scalar(select(func.count()).select_from(movement_query.order_by(None).subquery())) or 0
-                page=max(1,request.args.get('recent_page',1,type=int))
-                per_page=10
-                total_pages=max(1,(movement_count+per_page-1)//per_page)
-                page=min(page,total_pages)
-                recent=db.session.execute(movement_query.offset((page-1)*per_page).limit(per_page)).all()
-                recent_pagination={'page':page,'pages':total_pages,'total':movement_count,'has_prev':page>1,'has_next':page<total_pages}
-        return render_template('transaction.html',entry_today=business_today().isoformat(),entry_yesterday=(business_today()-timedelta(days=1)).isoformat(),banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36])
+                # New Transaction sidebar: only the current closing business day, latest 20 movements.
+                today_start_utc, today_scheduled_end_utc = dashboard_utc_window(business_today(), business_today())
+                movement_query = movement_query.where(
+                    Transaction.created_at >= today_start_utc,
+                    Transaction.created_at < min(today_scheduled_end_utc, now()))
+                recent=list(db.session.execute(movement_query.limit(20)).all())
+                if not movement_bank:
+                    from types import SimpleNamespace
+                    internal_query=Transaction.query.filter(
+                        platform_scope(Transaction), Transaction.status.in_(['confirmed','voided']),
+                        Transaction.remark.like('[DEPOSIT_BACK:%'),
+                        Transaction.created_at >= today_start_utc,
+                        Transaction.created_at < min(today_scheduled_end_utc, now()))
+                    if movement_search:
+                        internal_query=internal_query.filter(db.or_(
+                            Transaction.reference.ilike(pattern), Transaction.customer_ref.ilike(pattern)))
+                    internal=internal_query.order_by(Transaction.created_at.desc()).limit(20).all()
+                    recent.extend((SimpleNamespace(delta=t.signed_amount),t,'Internal · Deposit Back') for t in internal)
+                    recent.sort(key=lambda row: (row[1].created_at,row[1].id),reverse=True)
+                    recent=recent[:20]
+                recent_pagination=None
+        return render_template('transaction.html',entry_today=business_today().isoformat(),entry_yesterday=(business_today()-timedelta(days=1)).isoformat(),banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,bank_status_options=BANK_STATUSES,bank_details_map={d.bank_id:d for d in BankDetail.query.filter(BankDetail.bank_id.in_([b.id for b in balance_banks])).all()} if permitted('view_bank_details') and balance_banks else {},movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36],duplicate_form_state=getattr(g,'duplicate_transaction_form_state',None))
 
     @app.get('/banks/<bank_id>/investigation')
     @login_required
@@ -1313,23 +1893,119 @@ def create_app(test_config=None):
             return redirect(url_for('unclaimed_deposits'))
         banks_list=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
         lead_search=request.args.get('search','').strip()[:120]
-        lead_status=request.args.get('status','unclaimed').strip()
+        lead_status=request.args.get('status','all').strip()
         lead_bank=request.args.get('bank_id','').strip()
+        # Date filters use the same MYT calendar boundaries for confirmed transactions
+        # and investigation leads; invalid ranges are rejected rather than ignored.
+        raw_from=request.args.get('date_from','').strip()
+        raw_to=request.args.get('date_to','').strip()
+        try:
+            date_from=date.fromisoformat(raw_from) if raw_from else None
+            date_to=date.fromisoformat(raw_to) if raw_to else None
+            if date_from and date_to and date_from>date_to:
+                raise ValueError('From date cannot be after To date')
+        except ValueError:
+            flash('Invalid date range. Use YYYY-MM-DD and ensure From is not after To.','danger')
+            date_from=date_to=None
+            raw_from=raw_to=''
+        start_utc=datetime.combine(date_from,time.min,MYT).astimezone(timezone.utc) if date_from else None
+        end_utc=datetime.combine(date_to+timedelta(days=1),time.min,MYT).astimezone(timezone.utc) if date_to else None
+        valid_bank_ids={b.id for b in banks_list}
+        if lead_bank not in valid_bank_ids:lead_bank=''
+
         q=UnclaimedDeposit.query.filter(platform_scope(UnclaimedDeposit))
         if lead_status in ('unclaimed','claimed','dismissed'):q=q.filter(UnclaimedDeposit.status==lead_status)
-        if lead_bank and lead_bank in {b.id for b in banks_list}:q=q.filter(UnclaimedDeposit.bank_id==lead_bank)
+        if lead_bank:q=q.filter(UnclaimedDeposit.bank_id==lead_bank)
         if lead_search:q=q.filter(or_(UnclaimedDeposit.reference.ilike(f'%{lead_search}%'),UnclaimedDeposit.remark.ilike(f'%{lead_search}%')))
-        lead_page=max(1,request.args.get('page',1,type=int))
+        if start_utc:q=q.filter(UnclaimedDeposit.created_at>=start_utc)
+        if end_utc:q=q.filter(UnclaimedDeposit.created_at<end_utc)
+        lead_page=max(1,request.args.get('lead_page',1,type=int))
         pagination=q.order_by(UnclaimedDeposit.created_at.desc(),UnclaimedDeposit.id.desc()).paginate(page=lead_page,per_page=20,error_out=False)
-        return render_template('unclaimed.html',banks=banks_list,items=pagination.items,pagination=pagination,lead_search=lead_search,lead_status=lead_status,lead_bank=lead_bank)
+
+        # Confirmed Unclaim transactions are separate from investigation leads.
+        # Filter by bank through Entry so the list reflects the actual credited bank.
+        tq=Transaction.query.filter(platform_scope(Transaction),Transaction.kind=='unclaim')
+        if lead_bank:
+            tq=tq.filter(Transaction.id.in_(select(Entry.transaction_id).where(Entry.bank_id==lead_bank)))
+        if lead_search:
+            tq=tq.filter(or_(Transaction.reference.ilike(f'%{lead_search}%'),Transaction.remark.ilike(f'%{lead_search}%'),Transaction.customer_ref.ilike(f'%{lead_search}%')))
+        if start_utc:tq=tq.filter(Transaction.created_at>=start_utc)
+        if end_utc:tq=tq.filter(Transaction.created_at<end_utc)
+        tx_page=max(1,request.args.get('tx_page',1,type=int))
+        tx_pagination=tq.order_by(Transaction.created_at.desc(),Transaction.id.desc()).paginate(page=tx_page,per_page=20,error_out=False)
+        allocation_totals=dict(db.session.execute(select(UnclaimAllocation.original_transaction_id,
+            func.coalesce(func.sum(UnclaimAllocation.amount),0)).group_by(UnclaimAllocation.original_transaction_id)).all())
+        tx_ids=[t.id for t in tx_pagination.items]
+        entries=(Entry.query.filter(Entry.transaction_id.in_(tx_ids)).all() if tx_ids else [])
+        bank_names={b.id:b.name for b in banks_list}
+        tx_bank_names={e.transaction_id:bank_names.get(e.bank_id,'—') for e in entries}
+        def display_myt(value):
+            if not value:return ''
+            if value.tzinfo is None:value=value.replace(tzinfo=timezone.utc)
+            return value.astimezone(MYT).strftime('%Y-%m-%d %H:%M')
+        return render_template('unclaimed.html',banks=banks_list,items=pagination.items,
+            pagination=pagination,lead_search=lead_search,lead_status=lead_status,
+            lead_bank=lead_bank,date_from=raw_from,date_to=raw_to,
+            tx_items=tx_pagination.items,tx_pagination=tx_pagination,
+            tx_bank_names=tx_bank_names,display_myt=display_myt,current_business_day=business_today(),allocation_totals=allocation_totals)
+
+    @app.post('/unclaimed/transactions/<transaction_id>/assign')
+    @role_required('admin','staff')
+    def assign_confirmed_unclaim(transaction_id):
+        require_permission('manage_unclaimed')
+        require_permission('edit_transaction')
+        customer_ref=request.form.get('customer_ref','').strip()
+        deposit_ref=request.form.get('deposit_reference','').strip()
+        reason=request.form.get('reason','').strip()
+        try:
+            if not customer_ref or len(customer_ref)>120: raise ValueError('Customer ID required (max 120)')
+            if not deposit_ref or len(deposit_ref)>120: raise ValueError('New Deposit Transaction ID required (max 120)')
+            if len(reason)<5: raise ValueError('Reason must contain at least 5 characters')
+            identity=db.session.execute(select(Transaction.platform_id).where(Transaction.id==transaction_id)).scalar_one_or_none()
+            if not identity: abort(404)
+            require_platform(identity)
+            if require_single_platform()!=identity: abort(403)
+            entries=Entry.query.filter_by(transaction_id=transaction_id).all()
+            if len(entries)!=1 or money(entries[0].delta)<=0: raise ValueError('Invalid Unclaim bank credit')
+            bank_id=entries[0].bank_id
+            lock_banks([bank_id])
+            tx=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
+            if not tx or tx.kind!='unclaim' or tx.status!='confirmed': raise ValueError('Original Unclaim is not confirmed')
+            if Transaction.query.filter_by(reference=deposit_ref).first() or UnclaimAllocation.query.filter_by(deposit_reference=deposit_ref).first():
+                raise ValueError('Duplicate Deposit Transaction ID')
+            total=money(entries[0].delta)
+            allocated=money(db.session.execute(select(func.coalesce(func.sum(UnclaimAllocation.amount),0))
+                .where(UnclaimAllocation.original_transaction_id==tx.id)).scalar())
+            amount=amount_positive(request.form.get('amount',''))
+            if amount>total-allocated: raise ValueError('Assign exceeds remaining Unclaim amount')
+            # An allocation is a new current-time classification event, not a rewrite of old ledger/closing.
+            # The bank row lock serializes this with the closing engine and other allocations.
+            last=ClosingPeriod.query.filter_by(bank_id=bank_id,status='closed').order_by(ClosingPeriod.end_utc.desc()).first()
+            if last and _utc_db(last.end_utc)>now(): raise ValueError('Cannot allocate inside a finalized period')
+            db.session.add(UnclaimAllocation(original_transaction_id=tx.id,platform_id=tx.platform_id,
+                bank_id=bank_id,deposit_reference=deposit_ref,customer_ref=customer_ref,
+                amount=amount,reason=reason[:500],created_by=current_user.id))
+            db.session.add(Audit(actor_id=current_user.id,action='ALLOCATE_UNCLAIM',
+                detail=f'original={tx.id} deposit={deposit_ref} customer={customer_ref} amount={amount}; {reason[:400]}'))
+            db.session.commit()
+            flash('Unclaim allocated as Customer Deposit; bank ledger unchanged.','success')
+        except (ValueError,IntegrityError) as exc:
+            db.session.rollback();flash(str(exc),'danger')
+        return redirect(url_for('unclaimed_deposits'))
 
     @app.post('/unclaimed/<lead_id>/dismiss')
     @login_required
     def dismiss_unclaimed(lead_id):
         require_permission('manage_unclaimed')
-        lead=db.session.get(UnclaimedDeposit,lead_id)
+        # Lock order matches Closing: bank first, then lead. Prevent a claim from
+        # changing the observed Unclaimed state while Closing takes its snapshot.
+        lead_identity=db.session.execute(select(UnclaimedDeposit.bank_id,UnclaimedDeposit.platform_id).where(UnclaimedDeposit.id==lead_id)).first()
+        if not lead_identity:abort(404)
+        require_platform(lead_identity.platform_id)
+        lock_banks([lead_identity.bank_id])
+        lead=db.session.execute(select(UnclaimedDeposit).where(UnclaimedDeposit.id==lead_id).with_for_update()).scalar_one_or_none()
         if not lead:abort(404)
-        require_platform(lead.platform_id)
+        if lead.bank_id!=lead_identity.bank_id:abort(409,description='Unclaimed bank changed during request')
         if lead.bank.status=='closed':abort(409,description='Blocked bank: unclaimed lead frozen for settlement review')
         if lead.status!='unclaimed':abort(409,description='Only open leads can be dismissed')
         reason=request.form.get('reason','').strip()[:500]
@@ -1344,9 +2020,15 @@ def create_app(test_config=None):
     @login_required
     def claim_unclaimed(lead_id):
         require_permission('manage_unclaimed')
-        lead=db.session.get(UnclaimedDeposit,lead_id)
+        # Lock order matches Closing: bank first, then lead. Prevent a claim from
+        # changing the observed Unclaimed state while Closing takes its snapshot.
+        lead_identity=db.session.execute(select(UnclaimedDeposit.bank_id,UnclaimedDeposit.platform_id).where(UnclaimedDeposit.id==lead_id)).first()
+        if not lead_identity:abort(404)
+        require_platform(lead_identity.platform_id)
+        lock_banks([lead_identity.bank_id])
+        lead=db.session.execute(select(UnclaimedDeposit).where(UnclaimedDeposit.id==lead_id).with_for_update()).scalar_one_or_none()
         if not lead:abort(404)
-        require_platform(lead.platform_id)
+        if lead.bank_id!=lead_identity.bank_id:abort(409,description='Unclaimed bank changed during request')
         if lead.bank.status=='closed':abort(409,description='Blocked bank: unclaimed lead frozen for settlement review')
         transaction_ref=request.form.get('transaction_reference','').strip()
         if not transaction_ref:abort(400,description='Provide a confirmed deposit transaction reference')
@@ -1357,6 +2039,8 @@ def create_app(test_config=None):
         if not entry or money(entry.delta)!=money(lead.amount):
             abort(400,description='Bank or amount does not match confirmed deposit')
         if lead.status!='unclaimed':abort(409)
+        if db.session.execute(select(UnclaimedDeposit.id).where(UnclaimedDeposit.transaction_id==tx.id,UnclaimedDeposit.id!=lead.id)).first():
+            abort(409,description='This deposit is already linked to another unclaimed lead')
         lead.status='claimed';lead.transaction_id=tx.id
         db.session.add(Audit(actor_id=current_user.id,action='CLAIM_UNCLAIMED',detail=f'{lead.id} transaction={tx.id}'))
         db.session.commit();flash('Linked to confirmed deposit; no additional bank movement posted','success')
@@ -1367,10 +2051,13 @@ def create_app(test_config=None):
     def transactions():
         from sqlalchemy import or_
         day = selected_date()
-        q = Transaction.query.filter(Transaction.business_date == day,platform_scope(Transaction))
+        all_dates = request.args.get('all_dates') == '1'
+        q = Transaction.query.filter(platform_scope(Transaction))
+        if not all_dates:
+            q = q.filter(Transaction.business_date == day)
         search = request.args.get('search', '').strip()
         kinds = [v for v in request.args.getlist('kind')
-                 if v in ('deposit', 'withdrawal', 'transfer','dealer_sell','dealer_buy','dealer_payout')]
+                 if v in ('deposit', 'withdrawal', 'transfer','dealer_sell','dealer_buy','dealer_payout','cash_in','cash_out','internal_transfer')]
         kinds = list(dict.fromkeys(kinds))
         bank_id = request.args.get('bank_id', '').strip()
 
@@ -1409,17 +2096,17 @@ def create_app(test_config=None):
                 grouped.setdefault(transaction_id, []).append((delta, name))
             for t in records.items:
                 movements = grouped.get(t.id, [])
-                if t.kind == 'transfer':
+                if t.kind in ('transfer','internal_transfer'):
                     source = next((name for delta, name in movements if delta < 0), 'Unknown')
                     destination = next((name for delta, name in movements if delta > 0), 'Unknown')
                     transaction_banks[t.id] = f'{source} → {destination}'
                 else:
-                    transaction_banks[t.id] = movements[0][1] if movements else ('Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
+                    transaction_banks[t.id] = movements[0][1] if movements else ('Internal · Deposit Back' if (t.remark or '').startswith('[DEPOSIT_BACK:') else 'Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
 
         return render_template('transactions.html', records=records,
                                transaction_banks=transaction_banks,
                                banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all(),
-                               search=search, kinds=kinds, bank_id=bank_id, selected_day=day)
+                               search=search, kinds=kinds, bank_id=bank_id, selected_day=day, all_dates=all_dates)
 
     @app.get('/audit/transactions')
     @login_required
@@ -1442,6 +2129,22 @@ def create_app(test_config=None):
         if reference:q=q.filter(Transaction.reference.ilike(f'%{reference}%'))
         if action in ('CREATE','EDIT','VOID'):q=q.filter(TransactionAudit.action==action)
         if actor:q=q.join(User,User.id==TransactionAudit.actor_id).filter(User.username.ilike(f'%{actor}%'))
+        # Audit filters use Melbourne-local calendar dates, independent of Closing business dates.
+        from_date=request.args.get('from_date','').strip()
+        to_date=request.args.get('to_date','').strip()
+        try:
+            start_day=date.fromisoformat(from_date) if from_date else None
+            end_day=date.fromisoformat(to_date) if to_date else None
+            if start_day and end_day and start_day>end_day: raise ValueError('Date range reversed')
+        except ValueError:
+            abort(400, description='Invalid audit date range')
+        start_utc=datetime.combine(start_day,time.min,MYT).astimezone(timezone.utc) if start_day else None
+        end_utc=datetime.combine(end_day+timedelta(days=1),time.min,MYT).astimezone(timezone.utc) if end_day else None
+        def audit_date_filter(query, column):
+            if start_utc is not None: query=query.filter(column>=start_utc)
+            if end_utc is not None: query=query.filter(column<end_utc)
+            return query
+        q=audit_date_filter(q,TransactionAudit.created_at)
         page=max(1,request.args.get('page',1,type=int))
         logs=q.order_by(TransactionAudit.created_at.desc(),TransactionAudit.id.desc()).paginate(page=page,per_page=25,error_out=False)
         category=request.args.get('category','transactions').strip()
@@ -1450,16 +2153,18 @@ def create_app(test_config=None):
         if category=='bank_status':
             bank_q=BankStatusHistory.query.join(Bank,Bank.id==BankStatusHistory.bank_id).filter(platform_scope(Bank))
             if actor:bank_q=bank_q.join(User,User.id==BankStatusHistory.actor_id).filter(User.username.ilike(f'%{actor}%'))
+            bank_q=audit_date_filter(bank_q,BankStatusHistory.created_at)
             bank_logs=bank_q.order_by(BankStatusHistory.created_at.desc(),BankStatusHistory.id.desc()).paginate(page=page,per_page=25,error_out=False)
         elif category=='staff':
             # Account management events are separate from bank status and transaction history.
             # General Audit has no platform_id: restrict these records to administrators.
             if current_user.role!='admin':abort(403)
             staff_q=Audit.query.filter(db.or_(Audit.action.ilike('%STAFF%'),Audit.action.ilike('%USER%'),Audit.action.ilike('%PERMISSION%')))
+            staff_q=audit_date_filter(staff_q,Audit.created_at)
             staff_logs=staff_q.order_by(Audit.created_at.desc(),Audit.id.desc()).paginate(page=page,per_page=25,error_out=False)
         elif category!='transactions':
             category='transactions'
-        return render_template('transaction_audit.html',logs=logs,reference=reference,action=action,actor=actor,category=category,bank_logs=bank_logs,staff_logs=staff_logs,statuses=BANK_STATUSES)
+        return render_template('transaction_audit.html',logs=logs,reference=reference,action=action,actor=actor,category=category,bank_logs=bank_logs,staff_logs=staff_logs,statuses=BANK_STATUSES,from_date=from_date,to_date=to_date)
 
     @app.get('/audit/transactions/<audit_id>')
     @login_required
@@ -1490,6 +2195,9 @@ def create_app(test_config=None):
         if not t: abort(404)
         require_platform(t.platform_id)
         if request.method=='POST' and require_single_platform()!=t.platform_id:abort(403)
+        if (t.remark or '').startswith('[DEPOSIT_BACK:'):
+            flash('Deposit Back linked records cannot be edited individually','warning')
+            return redirect(url_for('transactions'))
         if request.method=='GET':
             if t.kind.startswith('dealer_'):
                 flash('Dealer transactions require a controlled reversal; editing is disabled','warning')
@@ -1507,7 +2215,9 @@ def create_app(test_config=None):
             if not t: abort(404)
             require_platform(t.platform_id)
             if require_single_platform()!=t.platform_id:abort(403)
+            if (t.remark or '').startswith('[DEPOSIT_BACK:'): raise ValueError('Deposit Back linked records cannot be voided individually')
             if t.kind.startswith('dealer_'): raise ValueError('Dealer transactions require an audited reversal; edit/void is disabled')
+            if t.kind=='unclaim' and UnclaimAllocation.query.filter_by(original_transaction_id=t.id).first(): raise ValueError('Allocated Unclaim cannot be voided; use an audited current-day adjustment')
             if t.status!='confirmed': raise ValueError('Transaction already voided')
             if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be edited')
             kind=request.form.get('kind','').strip()
@@ -1517,13 +2227,14 @@ def create_app(test_config=None):
             amount=amount_positive(request.form.get('amount',''))
             bank_id=request.form.get('bank_id','').strip()
             to_bank_id=request.form.get('to_bank_id','').strip() if kind=='transfer' else ''
-            if kind=='transfer' and (not to_bank_id or to_bank_id==bank_id): raise ValueError('Choose two different banks')
+            if kind in ('transfer','internal_transfer') and (not to_bank_id or to_bank_id==bank_id): raise ValueError('Choose two different banks')
             old_entries=Entry.query.filter_by(transaction_id=t.id).all()
             old_ids={e.bank_id for e in old_entries}
             new_ids={bank_id}|({to_bank_id} if to_bank_id else set())
             affected=old_ids|new_ids
             locked=lock_banks(affected)
             if len(locked)!=len(affected): raise ValueError('Bank not found')
+            _reject_closed_period_edits(t,affected)
             if Closing.query.filter(Closing.bank_id.in_(affected),Closing.business_date==t.business_date).first():
                 raise ValueError('Cannot edit: an affected bank has been closed for this business date')
             if any(b.platform_id!=t.platform_id for b in locked):abort(403)
@@ -1571,12 +2282,14 @@ def create_app(test_config=None):
             if not t: abort(404)
             require_platform(t.platform_id)
             if require_single_platform()!=t.platform_id:abort(403)
+            if (t.remark or '').startswith('[DEPOSIT_BACK:'): raise ValueError('Deposit Back linked records cannot be voided individually')
             if t.kind.startswith('dealer_'): raise ValueError('Dealer transactions require an audited reversal; edit/void is disabled')
             if t.status!='confirmed': raise ValueError('Transaction already voided')
             if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be voided')
             entries=Entry.query.filter_by(transaction_id=t.id).all()
             affected={e.bank_id for e in entries}
             banks=lock_banks(affected)
+            _reject_closed_period_edits(t,affected)
             if Closing.query.filter(Closing.bank_id.in_(affected),Closing.business_date==t.business_date).first():
                 raise ValueError('Cannot delete: an affected bank has been closed for this business date')
             # Removing a credit must not create a negative bank balance.
@@ -1594,6 +2307,10 @@ def create_app(test_config=None):
         except (ValueError,IntegrityError) as e:
             db.session.rollback();flash(str(e),'danger')
         destination=request.form.get('return_to','')
+        if destination=='unclaimed':
+            return redirect(url_for('unclaimed_deposits'))
+        if destination=='new_transaction':
+            return redirect(url_for('new_transaction')+'#latest-transactions')
         if destination=='dashboard':
             start=request.form.get('start_date','')
             end=request.form.get('end_date','')
@@ -1605,6 +2322,49 @@ def create_app(test_config=None):
             return redirect(url_for('dashboard'))
         return redirect(url_for('transactions'))
 
+    def _utc_db(dt):
+        """Postgres aware datetimes; SQLite may return naive UTC for tests."""
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+    def _closing_anchor(bank_id):
+        return (ClosingPeriod.query.filter_by(bank_id=bank_id)
+                .order_by(ClosingPeriod.end_utc.desc()).first())
+
+    def _reject_closed_period_edits(transaction, bank_ids):
+        """Protect historical closed periods even if their business_date differs."""
+        instant=_utc_db(transaction.created_at)
+        for bank_id in bank_ids:
+            for period in ClosingPeriod.query.filter_by(bank_id=bank_id,status='closed').all():
+                if _utc_db(period.start_utc) <= instant < _utc_db(period.end_utc):
+                    raise ValueError('Transaction is inside a finalized UTC closing period; use an audited adjustment')
+
+    @app.post('/closing/initialize')
+    @role_required('admin')
+    def initialize_closing_boundary():
+        """Explicit one-time bank anchor, never inferred from historical business_date."""
+        try:
+            pid=require_single_platform()
+            bank_id=request.form.get('bank_id','').strip()
+            bank_for_platform(bank_id,pid)
+            lock_banks([bank_id])
+            if _closing_anchor(bank_id): raise ValueError('This bank already has a closing period')
+            if Closing.query.filter_by(bank_id=bank_id).first():
+                raise ValueError('Historical closings exist: first reconcile and migrate them before initializing; no automatic guess allowed')
+            raw=request.form.get('anchor_utc','').strip()
+            anchor=datetime.fromisoformat(raw.replace('Z','+00:00'))
+            if anchor.tzinfo is None: raise ValueError('Anchor must include UTC offset')
+            anchor=as_utc(anchor)
+            if anchor>now(): raise ValueError('Anchor cannot be in the future')
+            # Anchor is represented as a zero-duration marker with separate status,
+            # never counted as a finalized closing period.
+            period=ClosingPeriod(bank_id=bank_id,start_utc=anchor,end_utc=anchor,status='anchor')
+            db.session.add(period)
+            db.session.add(Audit(actor_id=current_user.id,action='INITIALIZE_CLOSING_BOUNDARY',detail=f'{bank_id} UTC={anchor.isoformat()}'))
+            db.session.commit();flash('Closing boundary initialized. Next closing uses this exact UTC instant.','success')
+        except (ValueError,TypeError,IntegrityError) as exc:
+            db.session.rollback();flash(str(exc),'danger')
+        return redirect(url_for('closing'))
+
     @app.route('/closing',methods=['GET','POST'])
     @role_required('admin','finance')
     def closing():
@@ -1615,22 +2375,149 @@ def create_app(test_config=None):
                 bank_id=request.form.get('bank_id','');bank_for_platform(bank_id,pid);actual=money(request.form.get('actual',''))
                 bs=lock_banks([bank_id]);
                 if len(bs)!=1: raise ValueError('Bank not found')
+                if bs[0].status=='closed': raise ValueError('Closed banks cannot be reconciled or rolled into the next opening')
                 if Closing.query.filter_by(bank_id=bank_id,business_date=today).first(): raise ValueError('Already closed today')
-                sysbal=ledger_balance(bank_id)
+                previous=_closing_anchor(bank_id)
+                if previous is None:
+                    raise ValueError('Closing is blocked: Admin must initialize a verified UTC boundary for this bank first')
+                start=_utc_db(previous.end_utc)
+                policy=db.session.get(ClosingPolicy,1)
+                if policy is None: raise ValueError('Configure Business Timezone closing policy first')
+                end=next_boundary(start,policy.closing_hour,policy.closing_minute,policy.auto_timezone,policy.manual_offset_minutes)
+                if end>now(): raise ValueError('Scheduled closing time has not arrived yet')
+                # No silent skip: if the earliest due period is older than one day,
+                # require reconciliation instead of closing multiple days as one.
+                if now()-end>timedelta(hours=26):
+                    raise ValueError('Closing boundary is overdue; reconcile missed periods before proceeding')
+                overview=utc_bank_overview(db,Bank,Entry,Transaction,bs,start,end)[bank_id]
+                sysbal=ledger_balance_at_utc(bank_id,end)
+                verify_period(overview['opening'],overview['in_amount'],overview['out_amount'],sysbal,start,end,previous_end=start)
                 close=Closing(bank_id=bank_id,business_date=today,system_balance=sysbal,actual_balance=actual,difference=actual-sysbal,remark=request.form.get('remark','').strip(),created_by=current_user.id)
-                db.session.add(close);db.session.add(Audit(actor_id=current_user.id,action='CLOSE_BANK',detail=f'{bank_id} {today} difference={actual-sysbal}'))
-                db.session.commit();flash('Bank closed for today','success')
+                db.session.add(close)
+                db.session.flush()
+                period=ClosingPeriod(bank_id=bank_id,start_utc=start,end_utc=end,status='closed',closing_id=close.id)
+                db.session.add(period)
+                db.session.flush()
+                # Snapshot the state as it was OBSERVED at closing. Do not recalculate
+                # historical unclaimed values from mutable live lead statuses.
+                leads=db.session.execute(select(UnclaimedDeposit).where(
+                    UnclaimedDeposit.bank_id==bank_id,
+                    UnclaimedDeposit.status=='unclaimed',
+                    UnclaimedDeposit.created_at<end).order_by(UnclaimedDeposit.id).with_for_update()).scalars().all()
+                lead_items=[{'id':lead.id,'amount':str(money(lead.amount)),
+                             'reference':lead.reference} for lead in leads]
+                db.session.add(ClosingFinancialSnapshot(
+                    closing_period_id=period.id,bank_id=bank_id,
+                    opening=overview['opening'],incoming=overview['in_amount'],
+                    outgoing=overview['out_amount'],closing_balance=sysbal,
+                    unclaimed_amount=sum((money(lead.amount) for lead in leads),Decimal('0')),
+                    unclaimed_count=len(leads),
+                    unclaimed_json=json.dumps(lead_items,sort_keys=True)))
+                pending_close=pending_unclaim_at_utc(bank_id,end)
+                if pending_close<0: raise ValueError('Pending Unclaimed cannot be negative')
+                db.session.add(OperatingClosingSnapshot(closing_period_id=period.id,bank_id=bank_id,
+                    actual_bank_closing=sysbal,pending_unclaimed_closing=pending_close,
+                    operating_closing=sysbal-pending_close))
+                db.session.add(Audit(actor_id=current_user.id,action='CLOSE_BANK',detail=f'{bank_id} UTC=[{start.isoformat()},{end.isoformat()}) difference={actual-sysbal}'))
+                db.session.commit();flash('Bank closing saved with immutable UTC period','success')
             except (ValueError,IntegrityError) as e: db.session.rollback();flash(str(e),'danger')
             return redirect(url_for('closing'))
         day=selected_date()
         closes_all=Closing.query.filter(Closing.business_date==day,Closing.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).all()
         close_page=max(1,request.args.get('page',1,type=int))
         close_pagination=Closing.query.filter(Closing.business_date==day,Closing.bank_id.in_(select(Bank.id).where(platform_scope(Bank)))).order_by(Closing.created_at.desc(),Closing.id.desc()).paginate(page=close_page,per_page=15,error_out=False)
-        return render_template('closing.html',banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all(),balances=balances(),closes=close_pagination.items,close_pagination=close_pagination,closed_ids={c.bank_id for c in closes_all},selected_day=day,can_close=(day==today))
+        close_ids=[c.id for c in close_pagination.items]
+        operating_closes={}
+        if close_ids:
+            snap_rows=db.session.execute(select(ClosingPeriod.closing_id,OperatingClosingSnapshot)
+                .join(OperatingClosingSnapshot,OperatingClosingSnapshot.closing_period_id==ClosingPeriod.id)
+                .where(ClosingPeriod.closing_id.in_(close_ids))).all()
+            operating_closes=dict(snap_rows)
+        all_banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
+        operational_banks=[b for b in all_banks if b.status!='closed']
+        # Daily status transitions are immutable events. Capture the balance at
+        # the moment of closure from its immutable blocked-bank snapshot.
+        day_start=datetime.combine(day,datetime.min.time(),tzinfo=timezone_for_report_day(day)).astimezone(timezone.utc)
+        day_end=datetime.combine(day+timedelta(days=1),datetime.min.time(),tzinfo=timezone_for_report_day(day)).astimezone(timezone.utc)
+        closed_events=(db.session.execute(select(BankStatusHistory, Bank, BlockedUnclaimedSettlement)
+            .join(Bank,Bank.id==BankStatusHistory.bank_id)
+            .outerjoin(BlockedUnclaimedSettlement,BlockedUnclaimedSettlement.status_history_id==BankStatusHistory.id)
+            .where(platform_scope(Bank),BankStatusHistory.new_status=='closed',
+                   BankStatusHistory.old_status!='closed',BankStatusHistory.created_at>=day_start,
+                   BankStatusHistory.created_at<day_end)
+            .order_by(BankStatusHistory.created_at,BankStatusHistory.id)).all())
+        closed_details=[]
+        for event,bank,snap in closed_events:
+            closed_details.append({'bank':bank,'at':_utc_db(event.created_at).astimezone(timezone_for_report_day(day)).strftime('%Y-%m-%d %H:%M:%S'),'actor_id':event.actor_id,
+                'actual':money(snap.ledger_balance) if snap else None,
+                'pending':money(snap.unclaimed_amount) if snap else None,
+                'operating':money(snap.ledger_balance)-money(snap.unclaimed_amount) if snap else None})
+        # Overview of the chosen date; historical completed reconciliation uses
+        # immutable financial snapshots rather than live ledger recalculation.
+        all_day_closes={c.bank_id:c for c in closes_all}
+        day_snapshots={}
+        if all_day_closes:
+            for closing_id,snapshot in db.session.execute(select(ClosingPeriod.closing_id,OperatingClosingSnapshot)
+                .join(OperatingClosingSnapshot,OperatingClosingSnapshot.closing_period_id==ClosingPeriod.id)
+                .where(ClosingPeriod.closing_id.in_([c.id for c in closes_all]))):
+                day_snapshots[closing_id]=snapshot
+        total_actual=sum((money(x.actual_bank_closing) for x in day_snapshots.values()),Decimal('0'))
+        total_pending=sum((money(x.pending_unclaimed_closing) for x in day_snapshots.values()),Decimal('0'))
+        total_operating=sum((money(x.operating_closing) for x in day_snapshots.values()),Decimal('0'))
+        total_difference=sum((money(c.difference) for c in closes_all),Decimal('0'))
+        overview={'actual':total_actual,'pending':total_pending,'operating':total_operating,
+                  'difference':total_difference,'reconciled':len(closes_all),
+                  'active':len(operational_banks)}
+        return render_template('closing.html',banks=operational_banks,balances=balances(),closes=close_pagination.items,close_pagination=close_pagination,closed_ids={c.bank_id for c in closes_all},selected_day=day,can_close=(day==today),operating_closes=operating_closes,closed_details=closed_details,closed_count=len({x['bank'].id for x in closed_details}),closed_balance_total=sum((x['actual'] for x in closed_details if x['actual'] is not None),Decimal('0')),overview=overview,all_banks=all_banks)
 
     @app.context_processor
     def inject_report_date():
         return {'report_date': request.args.get('date', business_today().isoformat()), 'today_myt': business_today().isoformat(), 'platform_options': Platform.query.filter(Platform.id.in_(permitted_platform_ids()),Platform.active.is_(True)).order_by(Platform.name).all() if current_user.is_authenticated else [], 'active_platform_id': session.get('platform_id','all' if current_user.is_authenticated and current_user.role=='admin' else ''), 'can': permitted if current_user.is_authenticated else lambda _:False}
+
+    @app.get('/reports/utc-reconciliation')
+    @role_required('admin','finance')
+    def utc_reconciliation():
+        day=selected_date()
+        try:
+            start,end=utc_report_bounds(day)
+            banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
+            rows=utc_bank_overview(db,Bank,Entry,Transaction,banks,start,end)
+        except ValueError as exc:
+            flash(str(exc),'danger')
+            return redirect(url_for('closing'))
+        return render_template('utc_reconciliation.html',day=day,start=start,end=end,banks=banks,rows=rows)
+
+    @app.get('/reports/closing-verification')
+    @role_required('admin','finance')
+    def closing_verification():
+        from financial_integrity import verify_period
+        periods=(db.session.execute(select(ClosingPeriod)
+                 .where(ClosingPeriod.status=='closed',ClosingPeriod.bank_id.in_(
+                     select(Bank.id).where(platform_scope(Bank))))
+                 .order_by(ClosingPeriod.end_utc.desc()).limit(200)).scalars().all())
+        result=[]
+        for period in periods:
+            snap=ClosingFinancialSnapshot.query.filter_by(closing_period_id=period.id).first()
+            close=db.session.get(Closing,period.closing_id) if period.closing_id else None
+            if snap is None or close is None:
+                state='MISSING_SNAPSHOT'
+            else:
+                try:
+                    verify_period(snap.opening,snap.incoming,snap.outgoing,
+                                  snap.closing_balance,period.start_utc,period.end_utc)
+                    if money(snap.closing_balance)!=money(close.system_balance):
+                        raise ValueError('Closing system balance differs from snapshot')
+                    state='MATCH'
+                except ValueError:
+                    state='MISMATCH'
+            result.append({'bank_id':period.bank_id,'start':period.start_utc.isoformat(),
+                           'end':period.end_utc.isoformat(),'status':state})
+        return {'periods':result,'checked':len(result),
+                'mismatches':sum(row['status']!='MATCH' for row in result)}
+
+    # Stage 7: experimental Admin verification UI (no automatic scheduler).
+    from auto_closing_stage7 import bp as auto_closing_stage7_bp
+    app.register_blueprint(auto_closing_stage7_bp)
 
     @app.get('/health')
     def health(): return {'status':'ok'}

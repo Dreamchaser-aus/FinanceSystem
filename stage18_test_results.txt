@@ -1,0 +1,9 @@
+test_cross_platform_rejected (test_auto_closing_stage18.Stage18Integration.test_cross_platform_rejected) ... ok
+test_invalid_period_detected (test_auto_closing_stage18.Stage18Integration.test_invalid_period_detected) ... ok
+test_period_boundaries_and_accounting (test_auto_closing_stage18.Stage18Integration.test_period_boundaries_and_accounting) ... ok
+test_read_only_audit (test_auto_closing_stage18.Stage18Integration.test_read_only_audit) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.139s
+
+OK

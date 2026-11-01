@@ -1,0 +1,19 @@
+{% extends "base.html" %}{% block content %}
+<div class="container" style="max-width:850px"><h2>Clear Selected Platform</h2>
+<div class="alert alert-danger"><strong>PERMANENT DELETION.</strong> Only the selected platform's business records are deleted. All users, platform configuration, encryption keys, and global settings are retained. Other platforms are untouched. Download and securely store a full PostgreSQL backup first.</div>
+<div class="card p-3 mb-3"><h5>Step 1 — Download PostgreSQL backup</h5>
+<form method="post" action="{{url_for('clear_platform_backup')}}">
+<input type="hidden" name="csrf_token" value="{{csrf_token()}}">
+<label class="form-label">Platform to clear</label><select class="form-select mb-3" name="platform_id" required id="reset-platform" onchange="document.getElementById('execute-platform').value=this.value">
+<option value="">Choose one platform</option>{% for p in platforms %}<option value="{{p.id}}">{{p.name}}</option>{% endfor %}</select>
+<button class="btn btn-outline-primary" type="submit">Generate &amp; Download Full Database Backup (.dump)</button></form></div>
+<div class="card p-3"><h5>Step 2 — Confirm permanent reset</h5>
+{% if backup_ready %}<div class="alert alert-warning">A full backup was generated for the selected platform. Download must be saved and independently restore-tested. Confirm the file is saved and can be restored before proceeding.</div>{% else %}<div class="alert alert-secondary">First download a PostgreSQL backup. Reset is unavailable until backup generation succeeds.</div>{% endif %}
+<form method="post" action="{{url_for('clear_platform_execute')}}" onsubmit="return confirm('PERMANENTLY DELETE selected platform business data? This cannot be undone without restoring your backup.')">
+<input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input type="hidden" name="backup_proof_id" value="{{backup_proof.id if backup_proof else ''}}">
+<label class="form-label">Selected platform</label><select class="form-select mb-3" id="execute-platform" name="platform_id" required>{% for p in platforms %}<option value="{{p.id}}" {% if backup_proof and backup_proof.platform_id==p.id %}selected{% endif %}>{{p.name}}</option>{% endfor %}</select>
+<label class="form-label">Admin password</label><input class="form-control mb-3" type="password" name="password" autocomplete="current-password" required>
+<label class="form-label">Type CLEAR ALL DATA</label><input class="form-control mb-3" name="confirm_text" autocomplete="off" required>
+<label class="form-check mb-3"><input class="form-check-input" type="checkbox" name="backup_saved" value="yes" required> <span class="form-check-label">I saved the PostgreSQL backup and understand this operation is irreversible.</span></label>
+<button class="btn btn-danger" type="submit" {% if not backup_ready %}disabled{% endif %}>Permanently Clear Selected Platform</button></form></div></div>
+{% endblock %}

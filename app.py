@@ -2519,6 +2519,17 @@ def create_app(test_config=None):
     from auto_closing_stage7 import bp as auto_closing_stage7_bp
     app.register_blueprint(auto_closing_stage7_bp)
 
+    # JSON-aware HTTP errors: fetch() callers send Accept: application/json and must
+    # never receive Flask's HTML error page (it breaks response.json() in the browser).
+    from werkzeug.exceptions import HTTPException as _HTTPException
+    @app.errorhandler(_HTTPException)
+    def _json_http_error(e):
+        if request.accept_mimetypes.best!='application/json': return e
+        response=app.json.response({'ok':False,'duplicate':False,'error':e.description or e.name})
+        response.status_code=e.code or 500
+        response.headers['Cache-Control']='no-store'
+        return response
+
     @app.get('/health')
     def health(): return {'status':'ok'}
     return app

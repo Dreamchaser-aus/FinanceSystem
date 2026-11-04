@@ -5,6 +5,7 @@ from functools import wraps
 from zoneinfo import ZoneInfo
 from flask import Flask, render_template, redirect, url_for, flash, request, abort, g, session, send_file
 from flask_sqlalchemy import SQLAlchemy
+from urllib.parse import parse_qs
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect
 from sqlalchemy import func, select, UniqueConstraint, Index, or_, and_, case, text, delete
@@ -902,7 +903,29 @@ def create_app(test_config=None):
         if pid=='all' and current_user.role=='admin':pass
         elif pid not in permitted_platform_ids():abort(403)
         session['platform_id']=pid
-        return redirect(request.referrer if request.referrer and request.referrer.startswith(request.host_url) else url_for('new_transaction') if permitted('create_transaction') and current_user.role!='admin' else url_for('dashboard'))
+        page = request.form.get('return_page', '')
+        parent_pages = {
+            'reveal_bank_password': 'banks', 'bank_details': 'banks', 'blocked_settlements': 'banks',
+            'bank_investigation': 'workspace', 'edit_transaction': 'transactions',
+            'transaction_audit_detail': 'transaction_audit_list',
+        }
+        page = parent_pages.get(page, page)
+        pages = {
+            'dashboard', 'banks', 'dealers', 'new_transaction', 'workspace',
+            'unclaimed_deposits', 'transactions', 'transaction_audit_list',
+            'closing', 'utc_reconciliation', 'closing_verification', 'change_password',
+            'manage_staff', 'manage_platforms', 'manage_timezone', 'clear_platform_settings',
+        }
+        if page not in pages:
+            page = 'new_transaction' if current_user.role != 'admin' and permitted('create_transaction') else 'dashboard'
+        filters = {
+            key: values for key, values in parse_qs(request.form.get('return_filters', '')).items()
+            if key in ('date', 'start_date', 'end_date', 'from_date', 'to_date',
+                       'date_from', 'date_to', 'all_dates', 'kind', 'category',
+                       'bank_group', 'label', 'status', 'search', 'movement_search',
+                       'reference', 'action', 'actor')
+        }
+        return redirect(url_for(page, **filters))
 
     @app.route('/admin/timezone',methods=['GET','POST'])
     @role_required('admin')

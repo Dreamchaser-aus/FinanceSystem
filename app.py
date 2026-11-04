@@ -72,7 +72,7 @@ PERMISSIONS={
     'edit_transaction':'Edit / void transactions',
     'update_bank_status':'Update bank status',
     'view_dealers':'View dealer ledger',
-    'close_bank':'Daily closing',
+    'close_bank':'Daily Reconciliation (Finance role only)',
     'view_bank_balances':'View all bank balances in assigned platform',
     'view_bank_movements':'View recent bank movements',
     'create_bank':'Create bank with zero opening balance',
@@ -96,6 +96,8 @@ DEFAULT_ROLE_PERMS={
 
 def permitted(permission):
     if current_user.role=='admin': return True
+    if permission == 'close_bank' and current_user.role != 'finance':
+        return False
     return db.session.get(UserPermission,(current_user.id,permission)) is not None
 
 def require_permission(permission):

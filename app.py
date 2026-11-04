@@ -1823,6 +1823,29 @@ def create_app(test_config=None):
                 else:
                     flash(message,'danger')
         
+        today = business_today()
+        staff_totals = {}
+        if current_user.role == 'staff':
+            rows = db.session.execute(
+                select(Transaction.kind, func.count(Transaction.id), func.sum(Transaction.signed_amount))
+                .where(platform_scope(Transaction), Transaction.business_date == today,
+                       Transaction.status == 'confirmed',
+                       Transaction.kind.in_(('deposit', 'withdrawal', 'dealer_payout')))
+                .group_by(Transaction.kind))
+            totals = {kind: (count, money(amount)) for kind, count, amount in rows}
+            start, end = dashboard_utc_window(today, today)
+            claims, claimed_amount = db.session.execute(
+                select(func.count(UnclaimAllocation.id), func.coalesce(func.sum(UnclaimAllocation.amount), 0))
+                .where(platform_scope(UnclaimAllocation), UnclaimAllocation.created_at >= start,
+                       UnclaimAllocation.created_at < min(end, now()))).one()
+            deposits, received = totals.get('deposit', (0, 0))
+            withdrawals, paid = totals.get('withdrawal', (0, 0))
+            payouts, dealer_paid = totals.get('dealer_payout', (0, 0))
+            staff_totals = {
+                'Deposit': (deposits + claims, received + claimed_amount),
+                'Withdrawal': (withdrawals + payouts, abs(paid + dealer_paid)),
+            }
+
         balance_banks=[];balance_values={};bank_stats={};recent=[];recent_pagination=None
         if permitted('view_bank_balances'):
             balance_banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all()
@@ -1863,7 +1886,7 @@ def create_app(test_config=None):
                     recent.sort(key=lambda row: (row[1].created_at,row[1].id),reverse=True)
                     recent=recent[:20]
                 recent_pagination=None
-        return render_template('transaction.html',entry_today=business_today().isoformat(),entry_yesterday=(business_today()-timedelta(days=1)).isoformat(),banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,bank_status_options=BANK_STATUSES,bank_details_map={d.bank_id:d for d in BankDetail.query.filter(BankDetail.bank_id.in_([b.id for b in balance_banks])).all()} if permitted('view_bank_details') and balance_banks else {},movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36],duplicate_form_state=getattr(g,'duplicate_transaction_form_state',None))
+        return render_template('transaction.html',staff_totals=staff_totals,entry_today=today.isoformat(),entry_yesterday=(business_today()-timedelta(days=1)).isoformat(),banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,bank_status_options=BANK_STATUSES,bank_details_map={d.bank_id:d for d in BankDetail.query.filter(BankDetail.bank_id.in_([b.id for b in balance_banks])).all()} if permitted('view_bank_details') and balance_banks else {},movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36],duplicate_form_state=getattr(g,'duplicate_transaction_form_state',None))
 
     @app.get('/banks/<bank_id>/investigation')
     @login_required

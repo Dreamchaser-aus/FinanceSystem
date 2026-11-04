@@ -10,6 +10,19 @@
 <button type="button" class="btn btn-outline-info" data-quick-kind="deposit_back">Deposit Back</button>
 </div>
 </div>
+{% if staff_totals %}
+<div class="row g-2 mb-3">
+  {% for title, (count, amount) in staff_totals.items() %}
+  <div class="col-12 col-sm-6">
+    <section class="card p-3 h-100">
+      <h5>Today’s {{ title }}</h5>
+      <strong class="fs-4 money">AUD {{ amount|rm }}</strong>
+      <span class="text-muted">{{ count }} {{ 'transaction' if count == 1 else 'transactions' }} · {{ entry_today }}</span>
+    </section>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 <div class="modal fade" id="newTransactionEntryModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="newTransactionEntryTitle" aria-hidden="true">
  <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable"><div class="modal-content">
  <div class="modal-header"><h5 class="modal-title" id="newTransactionEntryTitle">Add New Transaction</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>

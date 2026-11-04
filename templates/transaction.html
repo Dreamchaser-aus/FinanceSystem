@@ -49,6 +49,12 @@
  </div><div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary" type="submit" form="newTransactionForm" id="submitBtn">Review &amp; Confirm Transaction</button></div>
  </div></div>
 </div>
+{% if can('view_bank_details') and not can('view_bank_balances') %}
+<section class="card p-3 mb-3"><h5>Bank Details</h5>
+<div class="d-flex flex-wrap gap-2">{% for b in banks %}
+<a class="btn btn-sm btn-outline-secondary" href="{{url_for('bank_details',bank_id=b.id,platform_id=b.platform_id)}}">{{b.name}}</a>
+{% else %}<span>No active banks in this platform.</span>{% endfor %}</div></section>
+{% endif %}
 <div class="row g-3"><div class="col-12">
 {% if can('view_bank_balances') %}<div class="card p-3 mb-3" id="newtx-bank-balances"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Active Bank Balances</h5><a class="btn btn-sm btn-outline-primary" href="{{url_for('new_transaction')}}">↻ Refresh</a></div><div class="d-flex flex-wrap gap-2 mb-2" id="newtx-bank-tabs" role="group" aria-label="Bank balance filters">
 {% for value,label in [('active','Active Banks'),('group:deposit','Deposit Bank'),('group:withdrawal','Withdraw Bank'),('group:store','Store'),('problem','Problem Bank'),('all','All Banks')] %}

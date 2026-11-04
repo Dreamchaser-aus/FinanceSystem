@@ -1165,6 +1165,36 @@ def create_app(test_config=None):
             flash('Invalid credentials','danger')
         return render_template('login.html')
 
+    @app.route('/account/password', methods=['GET', 'POST'])
+    @login_required
+    def change_password():
+        if request.method == 'POST':
+            old = request.form.get('current_password', '')
+            new = request.form.get('new_password', '')
+            previous_hash = current_user.password_hash
+            if not check_password_hash(previous_hash, old):
+                flash('Current password is incorrect.', 'danger')
+            elif len(new) < 6:
+                flash('Use at least 6 characters for your new password.', 'danger')
+            elif new != request.form.get('confirm_password'):
+                flash('New passwords do not match.', 'danger')
+            elif new == old:
+                flash('Choose a different password.', 'danger')
+            else:
+                uid = current_user.id
+                changed = User.query.filter_by(id=uid, password_hash=previous_hash).update(
+                    {'password_hash': generate_password_hash(new)}, synchronize_session=False)
+                if changed:
+                    db.session.add(Audit(actor_id=uid, action='CHANGE_PASSWORD', detail='Self-service password change'))
+                    db.session.commit()
+                    logout_user()
+                    session.clear()
+                    flash('Password changed. Sign in with your new password.', 'success')
+                    return redirect(url_for('login'))
+                db.session.rollback()
+                flash('Password was changed in another request. Enter your current password again.', 'danger')
+        return render_template('change_password.html')
+
     @app.post('/logout')
     @login_required
     def logout(): logout_user();session.pop('platform_id',None);return redirect(url_for('login'))

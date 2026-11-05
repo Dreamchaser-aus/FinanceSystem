@@ -154,17 +154,60 @@
 </div>
 {% endfor %}
 {% endif %}
-{% if can('view_bank_movements') %}<div class="card p-3" id="latest-transactions"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Latest Transactions — Today (Latest 20)</h5>{% if can('view_transactions') %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('transactions',all_dates=1)}}">View All</a>{% endif %}</div><form method="get" action="{{url_for('new_transaction')}}" class="d-flex gap-2 mb-2" id="movement-search-form"><select class="form-select form-select-sm" name="movement_bank" aria-label="Filter bank"><option value="">All banks</option>{% for b in balance_banks %}<option value="{{b.id}}" {{'selected' if movement_bank==b.id else ''}}>{{b.name}}</option>{% endfor %}</select><input type="search" class="form-control form-control-sm" name="movement_search" value="{{movement_search}}" placeholder="Search reference, customer or bank" aria-label="Search latest transactions"><button class="btn btn-sm btn-outline-primary" type="submit">Search</button>{% if movement_search %}<a class="btn btn-sm btn-outline-secondary" href="{{url_for('new_transaction')}}#latest-transactions">Clear</a>{% endif %}</form><div class="table-responsive" style="max-height:370px"><table class="table table-sm"><thead><tr><th>Time</th><th>Bank</th><th>Reference</th><th>Customer ID</th><th>Type</th><th class="text-end">AUD</th><th>Action</th></tr></thead><tbody>{% for e,t,name in recent %}<tr class="{{'table-danger' if t.status=='voided' else ''}}"><td class="small">{{t.created_at|mytime}}</td><td>{{name}}</td><td>{{t.reference}}{% if t.status=='voided' %}<span class="badge bg-danger ms-1">DELETED</span>{% endif %}</td><td class="text-break">{{t.customer_ref or '—'}}</td><td><span class="badge {{'bg-success' if t.kind=='deposit' else 'bg-warning text-dark' if t.kind in ('withdrawal','dealer_payout') else 'bg-secondary'}}">{{'Deposit' if t.kind=='deposit' else 'Withdrawal' if t.kind in ('withdrawal','dealer_payout') else t.kind|replace('_',' ')|title}}</span></td><td class="text-end money {{'text-danger text-decoration-line-through' if t.status=='voided' else ('text-success' if e.delta>=0 else 'text-danger')}}">{{'+' if e.delta>=0 else ''}}{{e.delta|rm}}</td><td>{% if t.status=='confirmed' and current_user.role in ('admin','staff') and t.business_date.isoformat()==entry_today and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') and not (t.remark or '').startswith('[DEPOSIT_BACK:') %}<button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#newtx-delete-{{t.id}}">Delete</button>{% elif t.status=='voided' %}<span class="badge bg-danger">Deleted</span>{% else %}<span class="text-muted">—</span>{% endif %}</td></tr>{% else %}<tr><td colspan="7">No recent movements</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}{% endif %}</div></div>
+{% if can('view_bank_movements') %}<div class="card p-3" id="latest-transactions"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Latest Transactions — Today (Latest 20)</h5>{% if can('view_transactions') %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('transactions',all_dates=1)}}">View All</a>{% endif %}</div><form method="get" action="{{url_for('new_transaction')}}" class="d-flex gap-2 mb-2" id="movement-search-form"><select class="form-select form-select-sm" name="movement_bank" aria-label="Filter bank"><option value="">All banks</option>{% for b in balance_banks %}<option value="{{b.id}}" {{'selected' if movement_bank==b.id else ''}}>{{b.name}}</option>{% endfor %}</select><input type="search" class="form-control form-control-sm" name="movement_search" value="{{movement_search}}" placeholder="Search reference, customer or bank" aria-label="Search latest transactions"><button class="btn btn-sm btn-outline-primary" type="submit">Search</button>{% if movement_search %}<a class="btn btn-sm btn-outline-secondary" href="{{url_for('new_transaction')}}#latest-transactions">Clear</a>{% endif %}</form><div class="table-responsive" style="max-height:370px"><table class="table table-sm"><thead><tr><th>Time</th><th>Bank</th><th>Reference</th><th>Customer ID</th><th>Type</th><th class="text-end">AUD</th><th>Action</th></tr></thead><tbody>{% for e,t,name in recent %}<tr class="{{'table-danger' if t.status=='voided' else ''}}" data-transaction-detail="newtx-detail-{{t.id}}" style="cursor:pointer"><td class="small">{{t.created_at|mytime}}</td><td>{{name}}</td><td><button type="button" class="btn btn-link btn-sm p-0 text-start" data-bs-toggle="modal" data-bs-target="#newtx-detail-{{t.id}}">{{t.reference}}</button>{% if recent_details[t.id].group %}<span class="badge bg-info text-dark ms-1">Deposit Back</span>{% endif %}{% if t.status=='voided' %}<span class="badge bg-danger ms-1">DELETED</span>{% endif %}</td><td class="text-break">{{t.customer_ref or '—'}}</td><td><span class="badge {{'bg-success' if t.kind=='deposit' else 'bg-warning text-dark' if t.kind in ('withdrawal','dealer_payout') else 'bg-secondary'}}">{{'Deposit Back' if recent_details[t.id].group else 'Deposit' if t.kind=='deposit' else 'Withdrawal' if t.kind in ('withdrawal','dealer_payout') else t.kind|replace('_',' ')|title}}</span></td><td class="text-end money {{'text-danger text-decoration-line-through' if t.status=='voided' else ('text-success' if e.delta>=0 else 'text-danger')}}">{{'+' if e.delta>=0 else ''}}{{e.delta|rm}}</td><td>{% if not recent_details[t.id].delete_reason %}<button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#newtx-delete-{{t.id}}">Delete</button>{% elif t.status=='voided' %}<span class="badge bg-danger">Deleted</span>{% else %}<button type="button" class="btn btn-sm btn-outline-secondary" disabled>Delete</button><small class="d-block text-muted">{{recent_details[t.id].delete_reason}}</small>{% endif %}</td></tr>{% else %}<tr><td colspan="7">No recent movements</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}{% endif %}</div></div>
 
+{% for id, d in recent_details.items() %}
+{% set t=d.transaction %}
+<div class="modal fade" id="newtx-detail-{{id}}" tabindex="-1" aria-labelledby="newtx-detail-title-{{id}}" aria-hidden="true">
+<div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
+<div class="modal-header"><h5 class="modal-title" id="newtx-detail-title-{{id}}">Transaction Details{% if d.group %} · Deposit Back{% endif %}</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+<div class="modal-body">
+<dl class="row">
+<dt class="col-sm-4">Platform</dt><dd class="col-sm-8">{{d.platform}}</dd>
+<dt class="col-sm-4">Created By</dt><dd class="col-sm-8">{{d.creator}}</dd>
+{% if d.group %}<dt class="col-sm-4">Linked Group</dt><dd class="col-sm-8 text-break">{{d.group}}</dd>{% endif %}
+</dl>
+{% for member in d.members %}
+<dl class="row border-top pt-2">
+{% for label,value in [('Reference',member.reference),('Customer ID',member.customer_ref or '—'),('Type',member.kind|replace('_',' ')|title),('Status',member.status),('Amount (AUD)',member.signed_amount|rm),('Business Date',member.business_date),('Created At (Melbourne)',member.created_at|mytime),('System ID',member.id)] %}
+<dt class="col-sm-4">{{label}}</dt><dd class="col-sm-8 text-break">{{value}}</dd>{% endfor %}
+<dt class="col-sm-4">Remark</dt><dd class="col-sm-8 text-break" style="white-space:pre-wrap">{{member.remark or '—'}}</dd>
+</dl>
+{% endfor %}
+<h6>Bank Movements (AUD)</h6>
+{% for entry,bank_name in d.entries %}<div class="d-flex justify-content-between gap-2"><span>{{bank_name}}</span><strong>{{'+' if entry.delta>=0 else ''}}{{entry.delta|rm}}</strong></div>{% else %}<p class="text-muted">No bank movements.</p>{% endfor %}
+{% if t.status=='voided' %}<p class="text-danger">Voided — these movements no longer count towards balances.</p>{% endif %}
+{% if d.trade %}{% set trade=d.trade %}
+<h6 class="mt-3">Dealer</h6><dl class="row">
+{% for label,value in [('Dealer',trade.dealer.name),('AUD Amount',trade.aud_amount|rm),('Exchange Rate',trade.rate),('MYR Amount',trade.myr_amount|rm),('MYR Change',trade.myr_delta|rm)] %}<dt class="col-sm-4">{{label}}</dt><dd class="col-sm-8">{{value}}</dd>{% endfor %}
+</dl>{% endif %}
+{% if t.kind=='unclaim' %}
+<h6 class="mt-3">Unclaim Allocations</h6>
+<p>Claimed AUD {{d.claims|sum(attribute='amount')|rm}} · Remaining AUD {{(t.signed_amount-d.claims|sum(attribute='amount'))|rm}}</p>
+{% for claim in d.claims %}<div class="border-top py-2 text-break">{{claim.deposit_reference}} · {{claim.customer_ref}} · AUD {{claim.amount|rm}}<br>{{claim.created_at|mytime}}<br>{{claim.reason}}</div>{% endfor %}
+{% endif %}
+</div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+</div></div></div>
+{% endfor %}
+<script>
+document.addEventListener('click', function(event) {
+  const row=event.target.closest('[data-transaction-detail]');
+  if (!row || event.target.closest('button,a,input,select,textarea') || window.getSelection().toString()) return;
+  const modal=document.getElementById(row.dataset.transactionDetail);
+  if (modal) bootstrap.Modal.getOrCreateInstance(modal).show();
+});
+</script>
 
-{% for e,t,name in recent %}
-{% if t.status=='confirmed' and current_user.role in ('admin','staff') and t.business_date.isoformat()==entry_today and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') and not (t.remark or '').startswith('[DEPOSIT_BACK:') %}
+{% for id,d in recent_details.items() %}
+{% set t=d.transaction %}
+{% set name=' / '.join(d.entries|map(attribute=1)|list) or 'Internal / Dealer' %}
+{% if not recent_details[t.id].delete_reason %}
 <div class="modal fade" id="newtx-delete-{{t.id}}" tabindex="-1" aria-labelledby="newtx-delete-title-{{t.id}}" aria-hidden="true">
  <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
   <form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}">
    <input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input type="hidden" name="return_to" value="new_transaction">
    <div class="modal-header"><h5 class="modal-title" id="newtx-delete-title-{{t.id}}">Delete Transaction</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-   <div class="modal-body"><dl class="row small mb-3"><dt class="col-4">Bank</dt><dd class="col-8">{{name}}</dd><dt class="col-4">Transaction ID</dt><dd class="col-8 text-break">{{t.reference}}</dd><dt class="col-4">Type</dt><dd class="col-8">{{t.kind|replace('_',' ')|title}}</dd><dt class="col-4">Amount</dt><dd class="col-8">AUD {{t.signed_amount|abs|rm}}</dd></dl>
+   <div class="modal-body">{% if d.group %}<div class="alert alert-warning">This deletes both linked Deposit Back records together.<br>{% for member in d.members %}{{member.kind|title}} · {{member.reference}} · AUD {{member.signed_amount|rm}}<br>{% endfor %}</div>{% endif %}<dl class="row small mb-3"><dt class="col-4">Bank</dt><dd class="col-8">{{name}}</dd><dt class="col-4">Transaction ID</dt><dd class="col-8 text-break">{{t.reference}}</dd><dt class="col-4">Type</dt><dd class="col-8">{{t.kind|replace('_',' ')|title}}</dd><dt class="col-4">Amount</dt><dd class="col-8">AUD {{t.signed_amount|abs|rm}}</dd></dl>
     <label class="form-label fw-semibold" for="newtx-delete-reason-{{t.id}}">Delete Remark <span class="text-danger">*</span></label><textarea id="newtx-delete-reason-{{t.id}}" class="form-control" name="reason" rows="3" minlength="5" maxlength="500" required placeholder="Minimum 5 characters"></textarea><div class="form-text">Soft delete with audit trail. Closed transactions cannot be deleted.</div>
    </div><div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-danger">Confirm Delete</button></div>
   </form>

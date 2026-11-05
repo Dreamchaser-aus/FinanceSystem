@@ -757,6 +757,13 @@ def record(kind,reference,amount,bank_id,user_id,customer_ref='',remark='',to_ba
     except Exception:
         db.session.rollback();raise
 
+def deposit_back_group(transaction):
+    remark=transaction.remark or ''
+    if remark.startswith('[DEPOSIT_BACK:') and ']' in remark:
+        return remark.split(']',1)[0]+']'
+    return None
+
+
 def record_deposit_back(withdraw_reference, deposit_reference, amount, user_id,
                         customer_ref='', remark='', platform_id=None, business_day=None):
     """Two counted customer movements, one atomic posting, zero net bank balance."""
@@ -1875,18 +1882,58 @@ def create_app(test_config=None):
                     from types import SimpleNamespace
                     internal_query=Transaction.query.filter(
                         platform_scope(Transaction), Transaction.status.in_(['confirmed','voided']),
-                        Transaction.remark.like('[DEPOSIT_BACK:%'),
+                        db.or_(Transaction.remark.like('[DEPOSIT_BACK:%'), Transaction.kind=='dealer_payout'),
                         Transaction.created_at >= today_start_utc,
                         Transaction.created_at < min(today_scheduled_end_utc, now()))
                     if movement_search:
                         internal_query=internal_query.filter(db.or_(
                             Transaction.reference.ilike(pattern), Transaction.customer_ref.ilike(pattern)))
-                    internal=internal_query.order_by(Transaction.created_at.desc()).limit(20).all()
-                    recent.extend((SimpleNamespace(delta=t.signed_amount),t,'Internal · Deposit Back') for t in internal)
+                    internal=internal_query.order_by(Transaction.created_at.desc()).limit(40).all()
+                    recent.extend((SimpleNamespace(delta=t.signed_amount),t,'Dealer payout' if t.kind=='dealer_payout' else 'Internal · Deposit Back') for t in internal)
                     recent.sort(key=lambda row: (row[1].created_at,row[1].id),reverse=True)
-                    recent=recent[:20]
+                    unique_recent={}
+                    for row in recent:
+                        key=(row[1].platform_id, deposit_back_group(row[1]) or row[1].id)
+                        unique_recent.setdefault(key,row)
+                    recent=list(unique_recent.values())[:20]
                 recent_pagination=None
-        return render_template('transaction.html',staff_totals=staff_totals,entry_today=today.isoformat(),entry_yesterday=(business_today()-timedelta(days=1)).isoformat(),banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,bank_status_options=BANK_STATUSES,bank_details_map={d.bank_id:d for d in BankDetail.query.filter(BankDetail.bank_id.in_([b.id for b in balance_banks])).all()} if permitted('view_bank_details') and balance_banks else {},movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36],duplicate_form_state=getattr(g,'duplicate_transaction_form_state',None))
+        recent_details={}
+        for _, transaction, _ in recent:
+            if transaction.id in recent_details: continue
+            group=deposit_back_group(transaction)
+            members=[transaction]
+            if group:
+                members=Transaction.query.filter(Transaction.platform_id==transaction.platform_id,
+                    Transaction.remark.startswith(group,autoescape=True)).order_by(Transaction.kind).all()
+            ids=[item.id for item in members]
+            entries=db.session.execute(select(Entry,Bank.name).join(Bank,Bank.id==Entry.bank_id)
+                .where(Entry.transaction_id.in_(ids),platform_scope(Bank))).all()
+            trade=DealerTrade.query.filter(DealerTrade.transaction_id.in_(ids)).first()
+            claims=UnclaimAllocation.query.filter(UnclaimAllocation.original_transaction_id.in_(ids),
+                platform_scope(UnclaimAllocation)).order_by(UnclaimAllocation.created_at).all()
+            creator=db.session.get(User,transaction.created_by)
+            platform=db.session.get(Platform,transaction.platform_id)
+            delete_reason=''
+            if not permitted('edit_transaction') or current_user.role not in ('admin','staff'):
+                delete_reason='No delete permission'
+            elif any(item.status!='confirmed' for item in members):
+                delete_reason='Already voided'
+            elif transaction.business_date!=today:
+                delete_reason='Only current-day records can be deleted'
+            elif claims:
+                delete_reason='Unclaim already allocated'
+            else:
+                affected={entry.bank_id for entry, _ in entries}
+                try:
+                    _reject_closed_period_edits(transaction,affected)
+                    if Closing.query.filter(Closing.bank_id.in_(affected),Closing.business_date==transaction.business_date).first():
+                        delete_reason='Bank already closed for this date'
+                except ValueError as exc:
+                    delete_reason=str(exc)
+            recent_details[transaction.id]=dict(delete_reason=delete_reason,transaction=transaction,members=members,group=group,
+                entries=entries,trade=trade,claims=claims,creator=creator.username if creator else transaction.created_by,
+                platform=platform.name if platform else transaction.platform_id)
+        return render_template('transaction.html',recent_details=recent_details,staff_totals=staff_totals,entry_today=today.isoformat(),entry_yesterday=(business_today()-timedelta(days=1)).isoformat(),banks=Bank.query.filter(platform_scope(Bank),Bank.active==True).order_by(Bank.name).all(),dealers=Dealer.query.filter(platform_scope(Dealer),Dealer.active==True).order_by(Dealer.name).all(),balance_banks=balance_banks,balance_values=balance_values,bank_stats=bank_stats,recent=recent,recent_pagination=recent_pagination,bank_status_options=BANK_STATUSES,bank_details_map={d.bank_id:d for d in BankDetail.query.filter(BankDetail.bank_id.in_([b.id for b in balance_banks])).all()} if permitted('view_bank_details') and balance_banks else {},movement_search=request.args.get('movement_search','').strip()[:120],movement_bank=request.args.get('movement_bank','').strip()[:36],duplicate_form_state=getattr(g,'duplicate_transaction_form_state',None))
 
     @app.get('/banks/<bank_id>/investigation')
     @login_required
@@ -2374,15 +2421,37 @@ def create_app(test_config=None):
         reason=request.form.get('reason','').strip()
         if len(reason)<5: flash('Deletion reason must contain at least 5 characters','danger');return redirect(url_for('transactions'))
         try:
-            t=db.session.execute(select(Transaction).where(Transaction.id==transaction_id).with_for_update()).scalar_one_or_none()
-            if not t: abort(404)
-            require_platform(t.platform_id)
-            if require_single_platform()!=t.platform_id:abort(403)
-            if (t.remark or '').startswith('[DEPOSIT_BACK:'): raise ValueError('Deposit Back linked records cannot be voided individually')
-            if t.kind.startswith('dealer_'): raise ValueError('Dealer transactions require an audited reversal; edit/void is disabled')
+            target=db.session.get(Transaction,transaction_id)
+            if not target: abort(404)
+            require_platform(target.platform_id)
+            if require_single_platform()!=target.platform_id:abort(403)
+            group=deposit_back_group(target)
+            query=select(Transaction).where(Transaction.id==transaction_id)
+            if group:
+                query=select(Transaction).where(Transaction.platform_id==target.platform_id,
+                    Transaction.remark.startswith(group, autoescape=True))
+            batch=db.session.execute(query.order_by(Transaction.id).with_for_update().execution_options(populate_existing=True)).scalars().all()
+            t=next(item for item in batch if item.id==transaction_id)
+            if group:
+                if (len(batch)!=2 or {item.kind for item in batch}!={'deposit','withdrawal'}
+                        or sum(item.signed_amount for item in batch)!=0
+                        or len({item.business_date for item in batch})!=1
+                        or len({item.customer_ref for item in batch})!=1
+                        or any(item.signed_amount<=0 if item.kind=='deposit' else item.signed_amount>=0 for item in batch)):
+                    raise ValueError('Deposit Back pair is incomplete or inconsistent; review required')
+                if any(item.status!='confirmed' for item in batch):
+                    raise ValueError('Deposit Back pair already voided or inconsistent')
+            if t.kind=='unclaim' and UnclaimAllocation.query.filter_by(original_transaction_id=t.id).first():
+                raise ValueError('Unclaim has allocations and cannot be voided')
+            if t.kind.startswith('dealer_'):
+                trade=DealerTrade.query.filter_by(transaction_id=t.id).first()
+                if not trade: raise ValueError('Dealer record missing; review required')
+                db.session.execute(select(Dealer).where(Dealer.id==trade.dealer_id).with_for_update()).scalar_one()
+
             if t.status!='confirmed': raise ValueError('Transaction already voided')
             if t.business_date!=business_today(): raise ValueError('Only current-day transactions can be voided')
-            entries=Entry.query.filter_by(transaction_id=t.id).all()
+            entries=Entry.query.filter(Entry.transaction_id.in_([item.id for item in batch])).all()
+            if group and entries: raise ValueError('Deposit Back has unexpected bank entries; review required')
             affected={e.bank_id for e in entries}
             banks=lock_banks(affected)
             _reject_closed_period_edits(t,affected)
@@ -2394,10 +2463,12 @@ def create_app(test_config=None):
             for b in banks:
                 if ledger_balance(b.id)-by_bank.get(b.id,Decimal('0'))<0:
                     raise ValueError(f'Cannot void: {b.name} would have a negative balance')
-            before_snapshot=transaction_snapshot(t,entries)
-            t.status='voided'
-            write_transaction_audit(t,current_user.id,'VOID',before=before_snapshot,after=transaction_snapshot(t,entries),reason=reason[:500])
-            db.session.add(Audit(actor_id=current_user.id,action='VOID_TRANSACTION',detail=f'{t.id} {t.reference}; reason={reason[:500]}'))
+            for item in batch:
+                item_entries=[entry for entry in entries if entry.transaction_id==item.id]
+                before_snapshot=transaction_snapshot(item,item_entries)
+                item.status='voided'
+                write_transaction_audit(item,current_user.id,'VOID',before=before_snapshot,after=transaction_snapshot(item,item_entries),reason=reason[:500])
+                db.session.add(Audit(actor_id=current_user.id,action='VOID_TRANSACTION',detail=f'{item.id} {item.reference}; group={group or ""}; reason={reason[:500]}'))
             db.session.commit()
             flash('Transaction voided; balances recalculated. History preserved.','success')
         except (ValueError,IntegrityError) as e:

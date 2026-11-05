@@ -1414,9 +1414,10 @@ def create_app(test_config=None):
             deposit_total['amount']+=allocation_amount
 
         # Dashboard retains its historical report-date filtering (V7.9.6.11 behavior).
-        latest = (Transaction.query.filter(Transaction.business_date >= start_day,
-                                           Transaction.business_date <= day, platform_scope(Transaction))
-                  .order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all())
+        latest_query = Transaction.query.filter(Transaction.business_date >= start_day,
+                                                Transaction.business_date <= day, platform_scope(Transaction))
+        latest = latest_query.order_by(Transaction.created_at.desc(), Transaction.id.desc()).limit(20).all()
+        latest_total = latest_query.count() if len(latest) >= 20 else len(latest)
         platform_names = {p.id:p.name for p in Platform.query.filter(Platform.id.in_({t.platform_id for t in latest})).all()} if latest else {}
         void_audits = (TransactionAudit.query.filter(TransactionAudit.transaction_id.in_([t.id for t in latest]),TransactionAudit.action=='VOID').order_by(TransactionAudit.created_at.desc()).all() if latest else [])
         void_actor_ids={a.actor_id for a in void_audits}
@@ -1485,7 +1486,7 @@ def create_app(test_config=None):
             dealer_items=dealer_items, dealer_totals=dealer_totals,
             active_customers=len(active_ids), new_customers=new_count,
             banks=bank_items, balances=display_bal, dashboard_bank_stats=dashboard_bank_stats, dashboard_unclaimed=unclaimed_components,
-            totals=totals, latest=latest, transaction_banks=transaction_banks, platform_names=platform_names, deleted_by=deleted_by,
+            totals=totals, latest=latest, latest_total=latest_total, transaction_banks=transaction_banks, platform_names=platform_names, deleted_by=deleted_by,
             grand=active_total, page_total=sum((bal[b.id] for b in bank_items), Decimal('0')),
             page_with_unclaimed=sum((display_bal[b.id] for b in bank_items), Decimal('0')),
             active_with_unclaimed=sum((display_bal[b.id] for b in active_banks), Decimal('0')),
@@ -1930,7 +1931,9 @@ def create_app(test_config=None):
                 movement_query = movement_query.where(
                     Transaction.created_at >= today_start_utc,
                     Transaction.created_at < min(today_scheduled_end_utc, now()))
-                recent=list(db.session.execute(movement_query.limit(20)).all())
+                recent_cap=500   # safety cap per source for one business day; pages are cut from this set
+                recent=list(db.session.execute(movement_query.limit(recent_cap)).all())
+                recent_capped=len(recent)>=recent_cap
                 if not movement_bank:
                     from types import SimpleNamespace
                     internal_query=Transaction.query.filter(
@@ -1941,15 +1944,22 @@ def create_app(test_config=None):
                     if movement_search:
                         internal_query=internal_query.filter(db.or_(
                             Transaction.reference.ilike(pattern), Transaction.customer_ref.ilike(pattern)))
-                    internal=internal_query.order_by(Transaction.created_at.desc()).limit(40).all()
+                    internal=internal_query.order_by(Transaction.created_at.desc()).limit(recent_cap).all()
+                    recent_capped=recent_capped or len(internal)>=recent_cap
                     recent.extend((SimpleNamespace(delta=t.signed_amount),t,'Dealer payout' if t.kind=='dealer_payout' else 'Internal · Deposit Back') for t in internal)
                     recent.sort(key=lambda row: (row[1].created_at,row[1].id),reverse=True)
                     unique_recent={}
                     for row in recent:
                         key=(row[1].platform_id, deposit_back_group(row[1]) or row[1].id)
                         unique_recent.setdefault(key,row)
-                    recent=list(unique_recent.values())[:20]
-                recent_pagination=None
+                    recent=list(unique_recent.values())
+                from types import SimpleNamespace as _NS
+                movement_page=max(1,request.args.get('movement_page',1,type=int))
+                recent_total=len(recent); recent_pages=max(1,(recent_total+19)//20)
+                movement_page=min(movement_page,recent_pages)
+                recent=recent[(movement_page-1)*20:movement_page*20]
+                recent_pagination=_NS(page=movement_page,pages=recent_pages,total=recent_total,per_page=20,capped=recent_capped,
+                                      has_prev=movement_page>1,has_next=movement_page<recent_pages,prev_num=movement_page-1,next_num=movement_page+1)
         recent_details={}
         for _, transaction, _ in recent:
             if transaction.id in recent_details: continue
@@ -2049,13 +2059,16 @@ def create_app(test_config=None):
         bank_ids=[b.id for b in banks_list]
         pending_balances=unclaimed_balance_components([b.id for b in banks_list])
         current_balances={b.id:ledger_balance(b.id)+pending_balances.get(b.id,Decimal('0.00')) for b in banks_list}
-        recent=[]
+        recent=[];recent_total=0
         if permitted('view_bank_movements') and bank_ids:
+            recent_where=(Entry.bank_id.in_(bank_ids),Transaction.status.in_(['confirmed','voided']),platform_scope(Transaction))
             recent=db.session.execute(select(Entry,Transaction,Bank.name)
                 .join(Transaction,Transaction.id==Entry.transaction_id)
                 .join(Bank,Bank.id==Entry.bank_id)
-                .where(Entry.bank_id.in_(bank_ids),Transaction.status.in_(['confirmed','voided']),platform_scope(Transaction))
+                .where(*recent_where)
                 .order_by(Transaction.created_at.desc()).limit(40)).all()
+            recent_total=db.session.scalar(select(func.count(Entry.id)).join(Transaction,Transaction.id==Entry.transaction_id)
+                .where(*recent_where)) if len(recent)>=40 else len(recent)
         pending={}
         if permitted('manage_unclaimed') and bank_ids:
             rows=db.session.execute(select(UnclaimedDeposit.bank_id,func.count(UnclaimedDeposit.id))
@@ -2063,7 +2076,7 @@ def create_app(test_config=None):
                 .group_by(UnclaimedDeposit.bank_id)).all()
             pending=dict(rows)
         return render_template('workspace.html',banks=banks_list,balances=current_balances,
-                               recent=recent,pending=pending)
+                               recent=recent,recent_total=recent_total,pending=pending)
 
     @app.route('/unclaimed',methods=['GET','POST'])
     @login_required
@@ -2765,10 +2778,13 @@ def create_app(test_config=None):
     @role_required('admin','finance')
     def closing_verification():
         from financial_integrity import verify_period
-        periods=(db.session.execute(select(ClosingPeriod)
-                 .where(ClosingPeriod.status=='closed',ClosingPeriod.bank_id.in_(
-                     select(Bank.id).where(platform_scope(Bank))))
-                 .order_by(ClosingPeriod.end_utc.desc()).limit(200)).scalars().all())
+        page_size=200
+        period_filter=(ClosingPeriod.status=='closed',ClosingPeriod.bank_id.in_(select(Bank.id).where(platform_scope(Bank))))
+        total_periods=db.session.scalar(select(func.count(ClosingPeriod.id)).where(*period_filter)) or 0
+        total_pages=max(1,(total_periods+page_size-1)//page_size)
+        page=min(max(1,request.args.get('page',1,type=int)),total_pages)
+        periods=(db.session.execute(select(ClosingPeriod).where(*period_filter)
+                 .order_by(ClosingPeriod.end_utc.desc()).limit(page_size).offset((page-1)*page_size)).scalars().all())
         result=[]
         for period in periods:
             snap=ClosingFinancialSnapshot.query.filter_by(closing_period_id=period.id).first()
@@ -2787,7 +2803,10 @@ def create_app(test_config=None):
             result.append({'bank_id':period.bank_id,'start':period.start_utc.isoformat(),
                            'end':period.end_utc.isoformat(),'status':state})
         return {'periods':result,'checked':len(result),
-                'mismatches':sum(row['status']!='MATCH' for row in result)}
+                'mismatches':sum(row['status']!='MATCH' for row in result),
+                # Paging info: without it a result of 200 looks complete even when older periods exist.
+                'page':page,'pages':total_pages,'total':total_periods,'page_size':page_size,
+                'truncated':total_pages>1,'next_page':page+1 if page<total_pages else None}
 
     # Stage 7: experimental Admin verification UI (no automatic scheduler).
     from auto_closing_stage7 import bp as auto_closing_stage7_bp

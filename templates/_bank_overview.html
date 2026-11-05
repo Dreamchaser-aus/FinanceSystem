@@ -14,7 +14,7 @@
 <td class="text-end"><span class="text-success">{{v.in_count}}</span><div class="text-muted small">{{v.in_amount|rm}}</div></td>
 <td class="text-end"><span class="text-danger">{{v.out_count}}</span><div class="text-muted small">{{v.out_amount|rm}}</div></td>
 <td>{% if overview_enable_status_edit|default(false) %}
-{% if current_user.role in ('admin','staff') %}
+{% if current_user.role in ('admin','staff') and b.status!='closed' %}
 <button type="button" class="btn btn-sm p-0 border-0 bg-transparent" data-bs-toggle="modal" data-bs-target="#newtx-bank-status-modal-{{b.id}}" title="Click to update current bank status" aria-label="Update status for {{b.name}}">
 <span class="badge {{'bg-success' if b.status=='active' else 'bg-secondary' if b.status=='closed' else 'bg-warning text-dark'}}">{{bank_status_options.get(b.status,b.status)}} <span aria-hidden="true">✎</span></span></button>
 {% else %}<span class="badge {{'bg-success' if b.status=='active' else 'bg-secondary' if b.status=='closed' else 'bg-warning text-dark'}}">{{bank_status_options.get(b.status,b.status)}}</span>{% endif %}

@@ -263,7 +263,7 @@ BANK_STATUSES={
     'cannot_transfer':'Cannot Transfer',
     'login_failed':'Login Failed',
     'wrong_password':'Wrong Password',
-    'closed':'Closed',
+    'closed':'Blocked',
     'other_issue':'Other Issue',
 }
 
@@ -1370,6 +1370,16 @@ def create_app(test_config=None):
         display_bal = {b.id: before_unclaim[b.id] + unclaimed_components[b.id] for b in existing}
         # "Bank Block" means status=closed; other issues remain in the closing total.
         blocked = [b for b in existing if statuses[b.id] == 'closed']
+        # When each bank was first marked Blocked (remark edits don't move it).
+        blocked_at = {}
+        if blocked:
+            for bid, ts in db.session.execute(
+                    select(BankStatusHistory.bank_id, func.min(BankStatusHistory.created_at))
+                    .where(BankStatusHistory.bank_id.in_([b.id for b in blocked]),
+                           BankStatusHistory.new_status == 'closed',
+                           BankStatusHistory.old_status != 'closed')
+                    .group_by(BankStatusHistory.bank_id)).all():
+                blocked_at[bid] = ts
         active_banks = [b for b in existing if statuses[b.id] == 'active']
         # Bank balance tabs use existing bank groups and statuses only.
         category_labels = []
@@ -1501,7 +1511,7 @@ def create_app(test_config=None):
             filtered_ledger_total=sum((before_unclaim[b.id] for b in filtered_active_banks), Decimal('0')),
             filtered_unclaimed_total=sum((unclaimed_components.get(b.id, Decimal('0')) for b in filtered_active_banks), Decimal('0')),
             filtered_with_unclaimed_total=sum((display_bal[b.id] for b in filtered_active_banks), Decimal('0')),
-            block_count=len(blocked), block_banks=blocked, closing_total=closing_total,
+            block_count=len(blocked), block_banks=blocked, blocked_at=blocked_at, closing_total=closing_total,
             closed_banks=closed_page.items, closed_page=closed_page,
             closed_count=closed_page.total, statuses=statuses, range_start_utc=range_start_utc, range_end_utc=range_end_utc)
 
@@ -1698,7 +1708,7 @@ def create_app(test_config=None):
             # be a separate, audited financial workflow with an explicit new anchor.
             if old_status=='closed' and new_status!='closed':
                 db.session.rollback()
-                flash('Closed banks cannot be reactivated via Status. A separately verified reopen workflow is required.','danger')
+                flash('Blocked banks cannot be changed to another status.','danger')
                 return status_return()
             if old_status==new_status and (bank.status_remark or '')==remark:
                 db.session.rollback()
@@ -2656,7 +2666,7 @@ def create_app(test_config=None):
                 bank_id=request.form.get('bank_id','');bank_for_platform(bank_id,pid);actual=money(request.form.get('actual',''))
                 bs=lock_banks([bank_id]);
                 if len(bs)!=1: raise ValueError('Bank not found')
-                if bs[0].status=='closed': raise ValueError('Closed banks cannot be reconciled or rolled into the next opening')
+                if bs[0].status=='closed': raise ValueError('Blocked banks cannot be reconciled or rolled into the next opening')
                 previous=_closing_anchor(bank_id)
                 if previous is None:
                     raise ValueError('Closing is blocked: Admin must initialize a verified UTC boundary for this bank first')

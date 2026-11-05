@@ -1,6 +1,6 @@
 {% extends 'base.html' %}
 {% block content %}
-<style>.bf-filter-mode{width:140px}.bf-filter-day{width:170px}.bf-filter-bank{min-width:175px;max-width:260px;flex:1}.bf-compact-filters .btn{white-space:nowrap}.bf-transaction-table thead th,.bf-transaction-table tbody td{text-align:center!important;vertical-align:middle}.bf-transaction-table tbody tr{transition:background .15s}.bf-transaction-table td{padding:11px 10px}.bf-transaction-table .font-monospace{font-size:.78rem}.bf-transaction-table .btn{min-width:68px}</style>
+<style>.bf-filter-mode{width:140px}.bf-filter-day{width:170px}.bf-filter-bank{min-width:175px;max-width:260px;flex:1}.bf-compact-filters .btn{white-space:nowrap}.bf-transaction-table thead th,.bf-transaction-table tbody td{text-align:center!important;vertical-align:middle}.bf-transaction-table tbody tr{transition:background .15s}.bf-transaction-table td{padding:11px 10px}.bf-transaction-table .font-monospace{font-size:.78rem}.bf-transaction-table .btn{min-width:68px}.bf-transaction-table tr.table-danger td:last-child{background:#f8d7da!important}.bf-transaction-table tbody tr[data-transaction-detail]:hover{background:#f7faff}</style>
 <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
   <div><h3 class="mb-1">Transaction Management</h3><div class="text-muted">Search, filter and review transactions</div></div>
   <a class="btn btn-primary" href="{{ url_for('new_transaction') }}">+ New Transaction</a>
@@ -28,7 +28,7 @@
       <thead class="table-light"><tr><th>Customer / ID</th><th>Bank Account</th><th>Amount</th><th>Actions</th></tr></thead>
       <tbody>
       {% for t in records.items %}
-        <tr class="{{'table-danger' if t.status=='voided' else ''}}">
+        <tr class="{{'table-danger' if t.status=='voided' else ''}}" data-transaction-detail="tx-detail-{{t.id}}" style="cursor:pointer">
           <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} Business GMT</div>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span>{% endif %}</td>
           <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
             {% if t.kind in ('deposit','cash_in') %}<span class="badge bg-success">Deposit</span>
@@ -39,7 +39,7 @@
             {% elif t.kind in ('transfer','internal_transfer') %}<span class="badge bg-primary">Transfer</span>
             {% else %}<span class="badge bg-secondary">{{ t.kind }}</span>{% endif %}
           </td>
-          <td class="money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind in ('deposit','cash_in','dealer_buy') else ('text-danger' if t.kind in ('withdrawal','cash_out','dealer_sell','dealer_payout') else '')) }}">{% if t.kind in ('deposit','cash_in','dealer_buy') %}+{% elif t.kind in ('withdrawal','cash_out','dealer_sell','dealer_payout') %}−{% endif %}{{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and can('edit_transaction') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<div class="d-flex justify-content-center gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}</td>
+          <td class="money text-nowrap fw-semibold {{ 'text-muted text-decoration-line-through' if t.status=='voided' else ('text-success' if t.kind in ('deposit','cash_in','dealer_buy') else ('text-danger' if t.kind in ('withdrawal','cash_out','dealer_sell','dealer_payout') else '')) }}">{% if t.kind in ('deposit','cash_in','dealer_buy') %}+{% elif t.kind in ('withdrawal','cash_out','dealer_sell','dealer_payout') %}−{% endif %}{{ t.signed_amount|abs|rm }}</td><td>{% if t.status=='confirmed' and can('edit_transaction') and t.business_date.isoformat()==today_myt and active_platform_id==t.platform_id and t.kind not in ('dealer_sell','dealer_buy','dealer_payout') %}<div class="d-flex justify-content-center gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="collapse" data-bs-target="#void-{{t.id}}">Delete</button></div><form method="post" action="{{url_for('delete_transaction',transaction_id=t.id)}}" class="collapse mt-2" id="void-{{t.id}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><input name="reason" class="form-control form-control-sm mb-1" minlength="5" maxlength="500" placeholder="Reason (min 5 chars)" required><button class="btn btn-sm btn-danger" onclick="return confirm('Void this transaction and recalculate balances?')">Confirm Delete</button></form>{% endif %}{% if t.status=='voided' %}{% set v=(details.get(t.id) or {}).get('void') %}<span class="badge bg-danger">Deleted</span>{% if v %}<div class="small mt-1">by <strong>{{ v.by }}</strong></div><div class="small text-muted">{{ v.at|mytime }}</div>{% endif %}{% endif %}</td>
         </tr>
       {% else %}
         <tr><td colspan="4" class="text-center text-muted py-4">No matching transactions</td></tr>
@@ -55,4 +55,13 @@
     </div>
   </div>
 </div>
+{% for id, d in details.items() %}{% include '_transaction_detail_modal.html' %}{% endfor %}
+<script>
+document.addEventListener('click', function(event) {
+  const row=event.target.closest('[data-transaction-detail]');
+  if (!row || event.target.closest('button,a,input,select,textarea,form,label') || window.getSelection().toString()) return;
+  const modal=document.getElementById(row.dataset.transactionDetail);
+  if (modal) bootstrap.Modal.getOrCreateInstance(modal).show();
+});
+</script>
 {% endblock %}

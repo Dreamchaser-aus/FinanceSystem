@@ -15,7 +15,11 @@ body.bf-anon{min-height:100vh;color:#e8f0ff;background:radial-gradient(900px 520
 .bf-login-card .form-control::placeholder{color:#6f86ad}
 .bf-login-card .form-control:hover{border-color:#3a63ad}
 .bf-login-card .form-control:focus{background:#0c2150;border-color:#5b9dff;box-shadow:0 0 0 .22rem #3b82f633;color:#fff}
-.bf-login-card input:-webkit-autofill{-webkit-text-fill-color:#fff;box-shadow:0 0 0 1000px #0a1a3f inset;caret-color:#fff}
+.bf-login-card .form-control{color-scheme:dark}
+/* Chrome paints saved-login previews / autofilled values with a light fill; force the dark fill and white text in every state */
+.bf-login-card input:-webkit-autofill,.bf-login-card input:-webkit-autofill:hover,.bf-login-card input:-webkit-autofill:focus,.bf-login-card input:-webkit-autofill:active{-webkit-text-fill-color:#fff!important;caret-color:#fff;box-shadow:0 0 0 1000px #0c2150 inset!important;border-color:#5b9dff;transition:background-color 99999s ease-out 0s}
+.bf-login-card input:autofill{-webkit-text-fill-color:#fff!important;box-shadow:0 0 0 1000px #0c2150 inset!important}
+.bf-login-card input:-webkit-autofill:focus{box-shadow:0 0 0 1000px #0c2150 inset,0 0 0 .22rem #3b82f633!important}
 .bf-pw{position:relative}.bf-pw .form-control{padding-right:3.2rem}
 .bf-pw-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);height:34px;padding:0 .65rem;border:0;border-radius:8px;background:transparent;color:#8fb0e8;font-size:.78rem;font-weight:700;cursor:pointer}
 .bf-pw-toggle:hover{color:#fff;background:#ffffff14}

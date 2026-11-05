@@ -1,12 +1,12 @@
 {% if can('view_bank_balances') %}
 <div class="table-responsive">
 <table class="table table-sm table-hover align-middle mb-0 bank-overview-table">
-<thead class="table-light"><tr><th>Bank</th><th>Group</th><th class="text-end">Opening</th><th class="text-end">Daily</th><th class="text-end">Current</th><th class="text-end">IN</th><th class="text-end">OUT</th><th>{% if overview_enable_status_edit|default(false) %}Status{% else %}Movements{% endif %}</th></tr></thead>
+<thead class="table-light"><tr>{% if pf_all %}<th>Platform</th>{% endif %}<th>Bank</th><th>Group</th><th class="text-end">Opening</th><th class="text-end">Daily</th><th class="text-end">Current</th><th class="text-end">IN</th><th class="text-end">OUT</th><th>{% if overview_enable_status_edit|default(false) %}Status{% else %}Movements{% endif %}</th></tr></thead>
 <tbody>
 {% for b in overview_banks %}
 {% set v=bank_stats[b.id] %}
 <tr {% if overview_enable_status_edit|default(false) %}data-newtx-bank-row data-bank-group="{{b.kind|e}}" data-bank-status="{{b.status|e}}" data-bank-active="{{'1' if b.active else '0'}}" {% if b.status!='active' or not b.active %}hidden{% endif %}{% endif %}>
-<td class="fw-semibold">{% if pf_all %}{{pf_chip(b.platform_id)}} {% endif %}{% if overview_enable_details_modal|default(false) and can('view_bank_details') %}<button type="button" class="btn btn-link btn-sm p-0 fw-semibold text-start" data-bs-toggle="modal" data-bs-target="#newtx-bank-details-modal-{{b.id}}" title="View details for {{b.name}}">{{b.name}}</button>{% else %}{{b.name}}{% endif %}{% if b.status=='closed' %} <a class="small" href="{{url_for('blocked_settlements',bank_id=b.id)}}">Settlement</a>{% endif %}{% if not b.active %} <span class="badge bg-secondary">Inactive</span>{% endif %}</td>
+{% if pf_all %}<td>{{pf_chip(b.platform_id)}}</td>{% endif %}<td class="fw-semibold">{% if overview_enable_details_modal|default(false) and can('view_bank_details') %}<button type="button" class="btn btn-link btn-sm p-0 fw-semibold text-start" data-bs-toggle="modal" data-bs-target="#newtx-bank-details-modal-{{b.id}}" title="View details for {{b.name}}">{{b.name}}</button>{% else %}{{b.name}}{% endif %}{% if b.status=='closed' %} <a class="small" href="{{url_for('blocked_settlements',bank_id=b.id)}}">Settlement</a>{% endif %}{% if not b.active %} <span class="badge bg-secondary">Inactive</span>{% endif %}</td>
 <td><span class="badge bg-light text-dark border">{{b.kind|title}}</span></td>
 <td class="text-end money">{{v.opening|rm}}</td>
 <td class="text-end money {{'text-success' if v.daily>0 else 'text-danger' if v.daily<0 else ''}}">{{'+' if v.daily>0 else ''}}{{v.daily|rm}}</td>
@@ -20,6 +20,6 @@
 {% else %}<span class="badge {{'bg-success' if b.status=='active' else 'bg-secondary' if b.status=='closed' else 'bg-warning text-dark'}}">{{bank_status_options.get(b.status,b.status)}}</span>{% endif %}
 {% else %}{% if can('view_bank_movements') %}<a class="btn btn-sm btn-outline-secondary" href="{{url_for('bank_investigation',bank_id=b.id)}}">History</a>{% else %}—{% endif %}{% endif %}</td>
 </tr>
-{% else %}<tr><td colspan="8" class="text-muted">No banks in this platform.</td></tr>{% endfor %}
+{% else %}<tr><td colspan="{{ 8 + (1 if pf_all else 0) }}" class="text-muted">No banks in this platform.</td></tr>{% endfor %}
 </tbody></table></div>
 {% endif %}

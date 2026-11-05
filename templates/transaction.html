@@ -17,7 +17,8 @@
     <section class="card p-3 h-100">
       <h5>Today’s {{ title }}</h5>
       <strong class="fs-4 money">AUD {{ amount|rm }}</strong>
-      <span class="text-muted">{{ count }} {{ 'transaction' if count == 1 else 'transactions' }} · {{ entry_today }}</span>
+      <strong class="fs-4 money">{{ count }} {{ 'transaction' if count == 1 else 'transactions' }}</strong>
+      <small class="text-muted">{{ entry_today }}</small>
     </section>
   </div>
   {% endfor %}

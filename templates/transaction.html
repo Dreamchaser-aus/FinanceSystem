@@ -88,7 +88,7 @@
 <button type="button" class="btn btn-sm {{'btn-primary' if value=='active' else 'btn-outline-primary'}}" data-newtx-bank-tab="{{value}}" aria-pressed="{{'true' if value=='active' else 'false'}}">{{label}}</button>
 {% endfor %}
 </div>
-{% if store_balances %}<div class="d-flex flex-wrap gap-2 align-items-center mb-2" id="newtx-store-balances">{% for name,amt in store_balances %}<span class="badge fs-6 {{'bg-danger' if amt<0 else 'bg-success' if amt>0 else 'bg-secondary'}}">{{name}} · {{'We owe' if amt<0 else 'Store owes us' if amt>0 else 'Settled'}} AUD {{amt|abs|rm}}</span>{% endfor %}</div>{% endif %}
+{% if store_balances %}<div class="d-flex flex-wrap gap-2 align-items-center mb-2" id="newtx-store-balances">{% for name,amt in store_balances %}<span class="badge fs-6 {{'bg-danger' if amt<0 else 'bg-success' if amt>0 else 'bg-secondary'}}">{{name}} {{amt|rm}}</span>{% endfor %}</div>{% endif %}
 <p class="small text-muted mb-2">AUD · Confirmed ledger balances · Opening / Daily use today's Melbourne business date. Problem Bank excludes Active and Block (Closed).</p><div style="max-height:370px;overflow:auto">{% set overview_banks=balance_banks %}{% set overview_enable_status_edit=true %}{% set overview_enable_details_modal=true %}{% include '_bank_overview.html' %}</div></div>
 {% if can('view_bank_details') %}
 {% for b in balance_banks %}

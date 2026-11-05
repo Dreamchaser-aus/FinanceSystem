@@ -11,7 +11,7 @@
 </form></div>
 <div class="card p-3"><h5>Confirmed Unclaim Transactions</h5>
 <div class="table-responsive"><table class="table align-middle"><thead><tr><th>Date / Time (Melbourne)</th><th>Transaction ID</th><th>Bank</th><th class="text-end">Amount (AUD)</th><th>Pending / Assigned</th><th>Status</th><th>Remark</th><th>Action</th></tr></thead><tbody>
-{% for tx in tx_items %}<tr><td>{{display_myt(tx.created_at)}}</td><td>{{tx.reference}}</td><td>{{tx_bank_names.get(tx.id,'—')}}</td><td class="text-end">{{tx.signed_amount|abs|rm}}</td><td>AUD {{((tx.signed_amount|abs)-allocation_totals.get(tx.id,0))|rm}} / {{allocation_totals.get(tx.id,0)|rm}}</td><td>{{tx.status|title}}</td><td>{{tx.remark or '—'}}</td><td>
+{% for tx in tx_items %}<tr><td>{{display_myt(tx.created_at)}}</td><td>{{tx.reference}}</td><td>{% if pf_all %}{{pf_chip(tx.platform_id)}} {% endif %}{{tx_bank_names.get(tx.id,'—')}}</td><td class="text-end">{{tx.signed_amount|abs|rm}}</td><td>AUD {{((tx.signed_amount|abs)-allocation_totals.get(tx.id,0))|rm}} / {{allocation_totals.get(tx.id,0)|rm}}</td><td>{{tx.status|title}}</td><td>{{tx.remark or '—'}}</td><td>
 {% if tx.status=='confirmed' and (tx.signed_amount|abs) > allocation_totals.get(tx.id,0) %}
 <div class="d-flex gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#assignUnclaim{{loop.index}}">Assign</button>{% if tx.business_date==current_business_day and not allocation_totals.get(tx.id,0) %}<button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#deleteUnclaim{{loop.index}}">Delete</button>{% endif %}</div>
 {% else %}<span class="text-muted small">Locked</span>{% endif %}

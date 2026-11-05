@@ -6,7 +6,7 @@
 {% for b in overview_banks %}
 {% set v=bank_stats[b.id] %}
 <tr {% if overview_enable_status_edit|default(false) %}data-newtx-bank-row data-bank-group="{{b.kind|e}}" data-bank-status="{{b.status|e}}" data-bank-active="{{'1' if b.active else '0'}}" {% if b.status!='active' or not b.active %}hidden{% endif %}{% endif %}>
-<td class="fw-semibold">{% if overview_enable_details_modal|default(false) and can('view_bank_details') %}<button type="button" class="btn btn-link btn-sm p-0 fw-semibold text-start" data-bs-toggle="modal" data-bs-target="#newtx-bank-details-modal-{{b.id}}" title="View details for {{b.name}}">{{b.name}}</button>{% else %}{{b.name}}{% endif %}{% if b.status=='closed' %} <a class="small" href="{{url_for('blocked_settlements',bank_id=b.id)}}">Settlement</a>{% endif %}{% if not b.active %} <span class="badge bg-secondary">Inactive</span>{% endif %}</td>
+<td class="fw-semibold">{% if pf_all %}{{pf_chip(b.platform_id)}} {% endif %}{% if overview_enable_details_modal|default(false) and can('view_bank_details') %}<button type="button" class="btn btn-link btn-sm p-0 fw-semibold text-start" data-bs-toggle="modal" data-bs-target="#newtx-bank-details-modal-{{b.id}}" title="View details for {{b.name}}">{{b.name}}</button>{% else %}{{b.name}}{% endif %}{% if b.status=='closed' %} <a class="small" href="{{url_for('blocked_settlements',bank_id=b.id)}}">Settlement</a>{% endif %}{% if not b.active %} <span class="badge bg-secondary">Inactive</span>{% endif %}</td>
 <td><span class="badge bg-light text-dark border">{{b.kind|title}}</span></td>
 <td class="text-end money">{{v.opening|rm}}</td>
 <td class="text-end money {{'text-success' if v.daily>0 else 'text-danger' if v.daily<0 else ''}}">{{'+' if v.daily>0 else ''}}{{v.daily|rm}}</td>

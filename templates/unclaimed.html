@@ -10,14 +10,14 @@
 <div class="col-12"><a class="btn btn-sm btn-outline-secondary" href="{{url_for('unclaimed_deposits')}}">Reset Filters</a></div>
 </form></div>
 <div class="card p-3"><h5>Confirmed Unclaim Transactions</h5>
-<div class="table-responsive"><table class="table align-middle"><thead><tr><th>Date / Time (Melbourne)</th><th>Transaction ID</th><th>Bank</th><th class="text-end">Amount (AUD)</th><th>Pending / Assigned</th><th>Status</th><th>Remark</th><th>Action</th></tr></thead><tbody>
-{% for tx in tx_items %}<tr><td>{{display_myt(tx.created_at)}}</td><td>{{tx.reference}}</td><td>{% if pf_all %}{{pf_chip(tx.platform_id)}} {% endif %}{{tx_bank_names.get(tx.id,'—')}}</td><td class="text-end">{{tx.signed_amount|abs|rm}}</td><td>AUD {{((tx.signed_amount|abs)-allocation_totals.get(tx.id,0))|rm}} / {{allocation_totals.get(tx.id,0)|rm}}</td><td>{{tx.status|title}}</td><td>{{tx.remark or '—'}}</td><td>
+<div class="table-responsive"><table class="table align-middle"><thead><tr>{% if pf_all %}<th>Platform</th>{% endif %}<th>Date / Time (Melbourne)</th><th>Transaction ID</th><th>Bank</th><th class="text-end">Amount (AUD)</th><th>Pending / Assigned</th><th>Status</th><th>Remark</th><th>Action</th></tr></thead><tbody>
+{% for tx in tx_items %}<tr>{% if pf_all %}<td>{{pf_chip(tx.platform_id)}}</td>{% endif %}<td>{{display_myt(tx.created_at)}}</td><td>{{tx.reference}}</td><td>{{tx_bank_names.get(tx.id,'—')}}</td><td class="text-end">{{tx.signed_amount|abs|rm}}</td><td>AUD {{((tx.signed_amount|abs)-allocation_totals.get(tx.id,0))|rm}} / {{allocation_totals.get(tx.id,0)|rm}}</td><td>{{tx.status|title}}</td><td>{{tx.remark or '—'}}</td><td>
 {% if tx.status=='confirmed' and (tx.signed_amount|abs) > allocation_totals.get(tx.id,0) %}
 <div class="d-flex gap-1 flex-wrap"><button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#assignUnclaim{{loop.index}}">Assign</button>{% if tx.business_date==current_business_day and not allocation_totals.get(tx.id,0) %}<button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#deleteUnclaim{{loop.index}}">Delete</button>{% endif %}</div>
 {% else %}<span class="text-muted small">Locked</span>{% endif %}
 </td></tr>
 
-{% else %}<tr><td colspan="8" class="text-muted">No Unclaim transactions in this range</td></tr>{% endfor %}
+{% else %}<tr><td colspan="{{ 8 + (1 if pf_all else 0) }}" class="text-muted">No Unclaim transactions in this range</td></tr>{% endfor %}
 </tbody></table></div><div class="d-flex justify-content-between align-items-center"><small>Page {{tx_pagination.page}} / {{tx_pagination.pages or 1}} · {{tx_pagination.total}} results</small><div>
 {% if tx_pagination.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('unclaimed_deposits',tx_page=tx_pagination.prev_num,search=lead_search,bank_id=lead_bank,date_from=date_from,date_to=date_to)}}">Previous</a>{% endif %}
 {% if tx_pagination.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('unclaimed_deposits',tx_page=tx_pagination.next_num,search=lead_search,bank_id=lead_bank,date_from=date_from,date_to=date_to)}}">Next</a>{% endif %}

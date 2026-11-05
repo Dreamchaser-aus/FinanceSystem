@@ -2247,7 +2247,55 @@ def create_app(test_config=None):
                 else:
                     transaction_banks[t.id] = movements[0][1] if movements else ('Internal · Deposit Back' if (t.remark or '').startswith('[DEPOSIT_BACK:') else 'Dealer → Customer' if t.kind=='dealer_payout' else 'Unknown')
 
-        return render_template('transactions.html', records=records,
+        # Detail-popup data (same content as the New Transaction "Latest Transactions" popup) and
+        # who deleted each voided record. Everything is fetched in batches, never per row.
+        details = {}
+        if ids:
+            groups = {t.id: deposit_back_group(t) for t in records.items}
+            members_by = {}
+            for t in records.items:
+                g = groups[t.id]
+                members_by[t.id] = (Transaction.query.filter(
+                    Transaction.platform_id == t.platform_id,
+                    Transaction.remark.startswith(g, autoescape=True)).order_by(Transaction.kind).all()
+                    if g else [t])
+            all_ids = {m.id for ms in members_by.values() for m in ms}
+            entry_rows = {}
+            for entry, bank_name in db.session.execute(
+                    select(Entry, Bank.name).join(Bank, Bank.id == Entry.bank_id)
+                    .where(Entry.transaction_id.in_(all_ids), platform_scope(Bank))).all():
+                entry_rows.setdefault(entry.transaction_id, []).append((entry, bank_name))
+            trade_rows = {}
+            for trade in DealerTrade.query.filter(DealerTrade.transaction_id.in_(all_ids)).all():
+                trade_rows.setdefault(trade.transaction_id, trade)
+            claim_rows = {}
+            for claim in (UnclaimAllocation.query
+                          .filter(UnclaimAllocation.original_transaction_id.in_(all_ids), platform_scope(UnclaimAllocation))
+                          .order_by(UnclaimAllocation.created_at).all()):
+                claim_rows.setdefault(claim.original_transaction_id, []).append(claim)
+            void_rows = {}
+            for audit in (TransactionAudit.query
+                          .filter(TransactionAudit.transaction_id.in_(all_ids), TransactionAudit.action == 'VOID')
+                          .order_by(TransactionAudit.created_at.desc()).all()):
+                void_rows.setdefault(audit.transaction_id, audit)
+            user_ids = {t.created_by for t in records.items} | {a.actor_id for a in void_rows.values()}
+            user_names = {u.id: u.username for u in User.query.filter(User.id.in_(user_ids)).all()} if user_ids else {}
+            platform_ids = {t.platform_id for t in records.items}
+            platform_names = {pl.id: pl.name for pl in Platform.query.filter(Platform.id.in_(platform_ids)).all()}
+            for t in records.items:
+                members = members_by[t.id]
+                audit = void_rows.get(t.id) or next((void_rows[m.id] for m in members if m.id in void_rows), None)
+                details[t.id] = dict(
+                    transaction=t, members=members, group=groups[t.id],
+                    entries=[row for m in members for row in entry_rows.get(m.id, [])],
+                    trade=next((trade_rows[m.id] for m in members if m.id in trade_rows), None),
+                    claims=[c for m in members for c in claim_rows.get(m.id, [])],
+                    creator=user_names.get(t.created_by, t.created_by),
+                    platform=platform_names.get(t.platform_id, t.platform_id),
+                    void=(dict(by=user_names.get(audit.actor_id, 'Unknown user'), at=audit.created_at,
+                               reason=audit.reason or '') if audit and t.status == 'voided' else None))
+
+        return render_template('transactions.html', records=records, details=details,
                                transaction_banks=transaction_banks,
                                banks=Bank.query.filter(platform_scope(Bank)).order_by(Bank.name).all(),
                                search=search, kinds=kinds, bank_id=bank_id, selected_day=day, all_dates=all_dates)

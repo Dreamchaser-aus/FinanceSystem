@@ -1,4 +1,4 @@
-"""Read-only dealer balances for the New Transaction page.
+"""Read-only dealer balances for the New Transaction page ("Dealers" tab).
 
 Each platform's Store is an ordinary Dealer whose name contains "Store" (rate 1).
 Its balance is the sum of DealerTrade.myr_delta over confirmed transactions, the
@@ -15,34 +15,39 @@ bp = Blueprint('store_balance', __name__)
 
 
 @bp.app_context_processor
-def inject_store_balances():
+def inject_dealer_rows():
+    """Rows for the "Dealers" tab under Active Bank Balances on the New Transaction page."""
     if request.endpoint != 'new_transaction' or not current_user.is_authenticated:
         return {}
     try:
-        from sqlalchemy import select, func, case
-        from app import db, Dealer, DealerTrade, Transaction, platform_scope, permitted, money
+        from sqlalchemy import select, func
+        from app import db, Dealer, DealerTrade, Platform, Transaction, platform_scope, permitted, money
         if not permitted('view_bank_balances'):
             return {}
-        # Per dealer: MYR balance (same as the Dealers page) and AUD balance. AUD is signed like
-        # myr_delta: dealer_sell is +, dealer_buy / dealer_payout are -.
-        aud_delta = case((DealerTrade.flow == 'dealer_sell', DealerTrade.aud_amount),
-                         else_=-DealerTrade.aud_amount)
-        rows = {r[0]: (r[1], r[2], r[3]) for r in db.session.execute(
-            select(DealerTrade.dealer_id, func.sum(DealerTrade.myr_delta),
-                   func.sum(aud_delta), func.count(DealerTrade.id))
-            .join(Transaction, Transaction.id == DealerTrade.transaction_id)
-            .where(Transaction.status == 'confirmed', platform_scope(Transaction))
-            .group_by(DealerTrade.dealer_id)).all()}
-        dealers = (Dealer.query.filter(platform_scope(Dealer), Dealer.active.is_(True))
-                   .order_by(Dealer.name).all())
+        # Confirmed totals per dealer and flow: AUD moved and the MYR effect (same source as the Dealers page).
+        totals = {}
+        for dealer_id, flow, aud, myr in db.session.execute(
+                select(DealerTrade.dealer_id, DealerTrade.flow,
+                       func.sum(DealerTrade.aud_amount), func.sum(DealerTrade.myr_delta))
+                .join(Transaction, Transaction.id == DealerTrade.transaction_id)
+                .where(Transaction.status == 'confirmed', platform_scope(Transaction))
+                .group_by(DealerTrade.dealer_id, DealerTrade.flow)).all():
+            t = totals.setdefault(dealer_id, {'sell': 0, 'buy': 0, 'payout': 0, 'myr': 0})
+            t[flow.replace('dealer_', '')] = money(aud)
+            t['myr'] += money(myr)
+        rows = db.session.execute(
+            select(Dealer, Platform.name).join(Platform, Platform.id == Dealer.platform_id)
+            .where(platform_scope(Dealer)).order_by(Platform.name, Dealer.name)).all()
         out = []
-        for d in dealers:
-            myr, aud, n = rows.get(d.id, (0, 0, 0))
-            if 'store' in d.name.lower():      # Store runs at rate 1: keep showing RM
-                out.append((d.name, money(myr), 'RM'))
-            elif n:                            # other dealers: AUD amount, only once they have trades
-                out.append((d.name, money(aud), 'AUD'))
-        return {'store_balances': out}
+        for d, _platform_name in rows:
+            t = totals.get(d.id, {'sell': 0, 'buy': 0, 'payout': 0, 'myr': 0})
+            is_store = 'store' in d.name.lower()   # Store runs at rate 1: balance in RM; other dealers in AUD
+            # AUD balance has the same sign as the MYR one: sell +, buy / payout -.
+            balance = money(t['myr']) if is_store else money(t['sell']) - money(t['buy']) - money(t['payout'])
+            out.append({'platform_id': d.platform_id, 'name': d.name, 'active': d.active,
+                        'unit': 'RM' if is_store else 'AUD', 'balance': balance,
+                        'sell': t['sell'], 'buy': t['buy'], 'payout': t['payout']})
+        return {'dealer_rows': out}
     except Exception:
-        current_app.logger.exception('Store balance label failed')
+        current_app.logger.exception('Dealer rows failed')
         return {}

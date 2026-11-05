@@ -87,12 +87,14 @@
 {% endif %}
 <div class="row g-3"><div class="col-12">
 {% if can('view_bank_balances') %}<div class="card p-3 mb-3" id="newtx-bank-balances"><div class="d-flex justify-content-between align-items-center mb-2"><h5 class="mb-0">Active Bank Balances</h5><a class="btn btn-sm btn-outline-primary" href="{{url_for('new_transaction')}}">↻ Refresh</a></div><div class="d-flex flex-wrap gap-2 mb-2" id="newtx-bank-tabs" role="group" aria-label="Bank balance filters">
-{% for value,label in [('active','Active Banks'),('group:deposit','Deposit Bank'),('group:withdrawal','Withdraw Bank'),('problem','Problem Bank'),('all','All Banks')] %}
+{% for value,label in [('active','Active Banks'),('group:deposit','Deposit Bank'),('group:withdrawal','Withdraw Bank'),('problem','Problem Bank'),('all','All Banks'),('dealers','Dealers')] %}
 <button type="button" class="btn btn-sm {{'btn-primary' if value=='active' else 'btn-outline-primary'}}" data-newtx-bank-tab="{{value}}" aria-pressed="{{'true' if value=='active' else 'false'}}">{{label}}</button>
 {% endfor %}
 </div>
-{% if store_balances %}<div class="d-flex flex-wrap gap-2 align-items-center mb-2" id="newtx-store-balances">{% for name,amt,unit in store_balances %}<span class="badge fs-6 {{'bg-danger' if amt<0 else 'bg-success' if amt>0 else 'bg-secondary'}}">{{name}} {{amt|rm}}{% if unit=='AUD' %} AUD{% endif %}</span>{% endfor %}</div>{% endif %}
-<p class="small text-muted mb-2">AUD · Confirmed ledger balances · Opening / Daily use today's Melbourne business date. Problem Bank excludes Active and Block (Closed).</p><div style="max-height:370px;overflow:auto">{% set overview_banks=balance_banks %}{% set overview_enable_status_edit=true %}{% set overview_enable_details_modal=true %}{% include '_bank_overview.html' %}</div></div>
+
+<p class="small text-muted mb-2">AUD · Confirmed ledger balances · Opening / Daily use today's Melbourne business date. Problem Bank excludes Active and Block (Closed).</p><div id="newtx-bank-table" style="max-height:370px;overflow:auto">{% set overview_banks=balance_banks %}{% set overview_enable_status_edit=true %}{% set overview_enable_details_modal=true %}{% include '_bank_overview.html' %}</div><div id="newtx-dealer-panel" hidden style="max-height:370px;overflow:auto"><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead class="table-light"><tr>{% if pf_all %}<th>Platform</th>{% endif %}<th>Dealer</th><th class="text-end">Balance</th><th class="text-end">AUD Sent</th><th class="text-end">AUD Received</th><th class="text-end">Direct Payout (AUD)</th></tr></thead><tbody>
+{% for d in dealer_rows|default([]) %}<tr>{% if pf_all %}<td>{{pf_chip(d.platform_id)}}</td>{% endif %}<td class="fw-semibold">{{d.name}}{% if not d.active %} <span class="badge bg-secondary">Inactive</span>{% endif %}</td><td class="text-end money fw-bold {{'text-danger' if d.balance<0 else 'text-success' if d.balance>0 else 'text-muted'}}">{{d.balance|rm}} <small class="fw-normal">{{d.unit}}</small></td><td class="text-end money">{{d.sell|rm}}</td><td class="text-end money">{{d.buy|rm}}</td><td class="text-end money">{{d.payout|rm}}</td></tr>{% else %}<tr><td colspan="{{ 5 + (1 if pf_all else 0) }}" class="text-muted">No dealers yet.</td></tr>{% endfor %}</tbody></table></div><p class="small text-muted mt-2 mb-0">Balance: red = we owe the dealer, green = the dealer owes us. Store is in RM (rate 1); other dealers are in AUD. Confirmed transactions only.</p></div>
+</div>
 {% if can('view_bank_details') %}
 {% for b in balance_banks %}
 {% set d=bank_details_map.get(b.id) %}
@@ -419,6 +421,8 @@ document.addEventListener('DOMContentLoaded', function () {
       tab.classList.toggle('btn-outline-primary', !selected);
       tab.setAttribute('aria-pressed', selected ? 'true' : 'false');
     });
+    const dealerPanel = document.getElementById('newtx-dealer-panel'), bankTable = document.getElementById('newtx-bank-table');
+    if (dealerPanel && bankTable) { dealerPanel.hidden = value !== 'dealers'; bankTable.hidden = value === 'dealers'; }
   }
   tabs.forEach(tab => tab.addEventListener('click', () => apply(tab.dataset.newtxBankTab)));
   apply('active');

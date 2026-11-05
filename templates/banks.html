@@ -2,7 +2,7 @@
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3"><h3 class="mb-0">Bank Status Management</h3></div>
 {% if can('create_bank') %}
-<div class="d-flex justify-content-end gap-2 flex-wrap mb-3"><button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addBankModal">＋ Add Bank</button>{% if current_user.role == 'admin' and can('create_bank') %}<button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addDealerModal">＋ Add Exchange Dealer</button>{% endif %}</div>
+<div class="d-flex justify-content-end gap-2 flex-wrap mb-3"><button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addBankModal">＋ Add Bank</button>{% if can('create_bank') %}<button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addDealerModal">＋ Add Exchange Dealer</button>{% endif %}</div>
 <style>
 /* V7.9.6.33: Make the Add Bank form itself the flex column used by Bootstrap's scrollable modal.
    Previously the form wrapper interrupted the modal-content > modal-body layout and hid the footer. */
@@ -37,7 +37,7 @@
 <div class="col-md-6"><label class="form-label">Reason / Remark (required for issues)</label><textarea name="remark" class="form-control" rows="2" maxlength="2000">{{b.status_remark or ''}}</textarea></div>
 <div class="col-md-2"><button class="btn btn-primary w-100" type="submit">Save</button></div></form></td></tr>{% endif %}
 {% else %}<tr><td colspan="9" class="text-muted text-center">No bank accounts</td></tr>{% endfor %}</tbody></table></div><div class="d-flex justify-content-between align-items-center"><small>Page {{bank_pagination.page}} / {{bank_pagination.pages or 1}}</small><div>{% if bank_pagination.has_prev %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('banks',bank_page=bank_pagination.prev_num,history_page=history_pagination.page,date=selected_day.isoformat(),label=label_filter,status=status_filter)}}">Previous</a>{% endif %} {% if bank_pagination.has_next %}<a class="btn btn-sm btn-outline-primary" href="{{url_for('banks',bank_page=bank_pagination.next_num,history_page=history_pagination.page,date=selected_day.isoformat(),label=label_filter,status=status_filter)}}">Next</a>{% endif %}</div></div></div>
-{% if current_user.role == 'admin' and can('create_bank') %}
+{% if can('create_bank') %}
 <div class="modal fade" id="addDealerModal" tabindex="-1" aria-labelledby="addDealerModalTitle" aria-hidden="true">
   <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content">

@@ -41,11 +41,10 @@ def inject_dealer_rows():
         out = []
         for d, _platform_name in rows:
             t = totals.get(d.id, {'sell': 0, 'buy': 0, 'payout': 0, 'myr': 0})
-            is_store = 'store' in d.name.lower()   # Store runs at rate 1: balance in RM; other dealers in AUD
-            # AUD balance has the same sign as the MYR one: sell +, buy / payout -.
-            balance = money(t['myr']) if is_store else money(t['sell']) - money(t['buy']) - money(t['payout'])
+            # Every dealer (Store included) is shown in AUD; sign: sell +, buy / payout -.
+            balance = money(t['sell']) - money(t['buy']) - money(t['payout'])
             out.append({'platform_id': d.platform_id, 'name': d.name, 'active': d.active,
-                        'unit': 'RM' if is_store else 'AUD', 'balance': balance,
+                        'balance': balance,
                         'sell': t['sell'], 'buy': t['buy'], 'payout': t['payout']})
         return {'dealer_rows': out}
     except Exception:

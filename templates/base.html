@@ -266,10 +266,32 @@ h3+.text-muted,h3+div.text-muted{margin-top:.1rem}
  .bf-pp-btn{height:38px;max-width:46vw}
  .bf-pp-menu{position:fixed;left:10px;right:10px;top:calc(var(--bf-top) - 4px);width:auto;max-width:none}
 }
+
+/* ===== Logo + account menu (top bar). Replaces the sidebar footer (user / password / logout). ===== */
+.bf-acct{position:relative;flex:none}
+.bf-logo-btn{display:flex;align-items:center;gap:6px;height:40px;padding:2px;border:1px solid #ffffff3d;border-radius:11px;background:#030a1f;cursor:pointer;overflow:hidden;transition:border-color .15s,box-shadow .15s}
+.bf-logo-btn img{display:block;height:34px;width:auto;border-radius:8px}
+.bf-logo-btn:hover,.bf-logo-btn[aria-expanded="true"]{border-color:#7fb0ff;box-shadow:0 0 0 3px #3b82f633}
+.bf-acct-menu{position:absolute;left:0;top:calc(100% + 10px);z-index:1060;width:260px;max-width:calc(100vw - 20px);background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 18px 48px #0c28404d;overflow:hidden;color:var(--ink)}
+.bf-acct-menu[hidden]{display:none}
+.bf-acct-head{display:flex;align-items:center;gap:12px;padding:14px;background:linear-gradient(105deg,#0d263f,#173f68);color:#fff}
+.bf-acct-avatar{flex:none;width:40px;height:40px;border-radius:50%;display:grid;place-items:center;background:#ffffff26;border:1px solid #ffffff4d;font-weight:800;font-size:1.05rem;text-transform:uppercase}
+.bf-acct-name{font-weight:750;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bf-acct-role{font-size:.74rem;letter-spacing:.04em;text-transform:uppercase;color:#cfe0f5}
+.bf-acct-who{min-width:0}
+.bf-acct-items{padding:6px}
+.bf-acct-item{display:flex;align-items:center;gap:11px;width:100%;padding:10px 11px;border:0;border-radius:9px;background:transparent;color:#2a3d57;font:inherit;font-size:.9rem;font-weight:600;text-align:left;text-decoration:none;cursor:pointer}
+.bf-acct-item:hover,.bf-acct-item:focus-visible{background:#f0f5fd;color:#1d5de1;outline:none}
+.bf-acct-item.danger{color:#c52f3e}.bf-acct-item.danger:hover,.bf-acct-item.danger:focus-visible{background:#fdeaec;color:#b42335}
+.bf-acct-item .ic{flex:none;width:20px;text-align:center;font-size:1.05rem}
+.bf-acct-sep{height:1px;background:var(--line);margin:4px 6px}
+.bf-acct-items form{margin:0}
+@media(max-width:767px){.bf-top-actions{gap:6px}.bf-platform-form.bf-pp-on{flex:1 1 0;max-width:200px;min-width:0}.bf-pp-btn{max-width:100%;width:100%;min-width:0}.bf-pp-name{flex:1}.bf-logo-btn{height:38px}.bf-logo-btn img{height:32px}.bf-acct-menu{position:fixed;left:10px;top:calc(var(--bf-top) - 4px);width:min(300px,calc(100vw - 20px))}}
+@media(max-width:420px){.bf-pp-ico{display:none}.bf-pp-btn{padding:0 8px;gap:6px}}
 </style></head><body class="{{'' if current_user.is_authenticated else 'bf-anon'}}">
 <a class="bf-skip" href="#bf-content">Skip to content</a>
 <script>(function(){try{var w=innerWidth;if(w>=768&&(w<1200||localStorage.getItem('bf-sidebar-collapsed')==='1'))document.body.classList.add('bf-rail')}catch(e){}})()</script>
-<header class="bf-topbar">{% if current_user.is_authenticated %}<button type="button" class="bf-menu-btn" id="bf-menu-btn" aria-label="Open menu" aria-controls="bf-sidebar" aria-expanded="false">☰</button><div class="bf-top-actions"><form method="post" action="{{url_for('switch_platform')}}" class="bf-platform-form" title="Working Platform"><input type="hidden" name="return_page" value="{{ request.endpoint }}"><input type="hidden" name="return_filters" value="{{ request.query_string.decode('latin1') }}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><select id="bf-working-platform" name="platform_id" class="form-select form-select-sm bf-platform-select" onchange="this.form.submit()" aria-label="Working Platform">{% if current_user.role=='admin' %}<option value="all" {{'selected' if active_platform_id=='all' else ''}}>All Platforms (reports)</option>{% endif %}{% for p in platform_options %}<option value="{{p.id}}" {{'selected' if active_platform_id==p.id else ''}}>{{p.name}}</option>{% endfor %}</select></form><div class="bf-live-clock" role="timer" aria-label="Current Melbourne time" title="Live Australia/Melbourne time (not the closing policy)"><span class="bf-clock-dot" aria-hidden="true"></span><div><div class="bf-clock-main" id="bf-melbourne-time">--:--:--</div><div class="bf-clock-meta" id="bf-melbourne-zone">MELBOURNE · GMT--</div></div></div></div>{% else %}<a class="bf-brand" href="{{url_for('login')}}">BankFlow</a>{% endif %}</header>
+<header class="bf-topbar">{% if current_user.is_authenticated %}<button type="button" class="bf-menu-btn" id="bf-menu-btn" aria-label="Open menu" aria-controls="bf-sidebar" aria-expanded="false">☰</button><div class="bf-top-actions"><div class="bf-acct"><button type="button" class="bf-logo-btn" id="bf-acct-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="bf-acct-menu" aria-label="Account menu — {{current_user.username}}" title="{{current_user.username}}"><img src="{{ url_for('static', filename='trax-mark.jpg') }}" alt="TRAX" width="64" height="34"></button><div class="bf-acct-menu" id="bf-acct-menu" role="menu" hidden><div class="bf-acct-head"><span class="bf-acct-avatar" aria-hidden="true">{{current_user.username[:1]}}</span><div class="bf-acct-who"><div class="bf-acct-name">{{current_user.username}}</div><div class="bf-acct-role">{{current_user.role|title}}</div></div></div><div class="bf-acct-items"><a class="bf-acct-item" role="menuitem" href="{{url_for('change_password')}}"><span class="ic" aria-hidden="true">⚿</span>Change password</a><div class="bf-acct-sep" role="separator"></div><form method="post" action="{{url_for('logout')}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button class="bf-acct-item danger" role="menuitem" type="submit"><span class="ic" aria-hidden="true">⎋</span>Log out</button></form></div></div></div><form method="post" action="{{url_for('switch_platform')}}" class="bf-platform-form" title="Working Platform"><input type="hidden" name="return_page" value="{{ request.endpoint }}"><input type="hidden" name="return_filters" value="{{ request.query_string.decode('latin1') }}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><select id="bf-working-platform" name="platform_id" class="form-select form-select-sm bf-platform-select" onchange="this.form.submit()" aria-label="Working Platform">{% if current_user.role=='admin' %}<option value="all" {{'selected' if active_platform_id=='all' else ''}}>All Platforms (reports)</option>{% endif %}{% for p in platform_options %}<option value="{{p.id}}" {{'selected' if active_platform_id==p.id else ''}}>{{p.name}}</option>{% endfor %}</select></form><div class="bf-live-clock" role="timer" aria-label="Current Melbourne time" title="Live Australia/Melbourne time (not the closing policy)"><span class="bf-clock-dot" aria-hidden="true"></span><div><div class="bf-clock-main" id="bf-melbourne-time">--:--:--</div><div class="bf-clock-meta" id="bf-melbourne-zone">MELBOURNE · GMT--</div></div></div></div>{% else %}<a class="bf-brand" href="{{url_for('login')}}">BankFlow</a>{% endif %}</header>
 {% if current_user.is_authenticated %}<aside class="bf-sidebar" id="bf-sidebar"><div class="bf-sidebar-head"><button type="button" class="btn btn-outline-secondary btn-sm bf-side-toggle" id="bf-toggle" aria-label="Toggle sidebar" aria-expanded="true" title="Toggle sidebar">☰ <span class="bf-side-label">Collapse sidebar</span></button></div><div class="bf-sidebar-links">
 {% if can('view_dashboard') %}<a class="bf-side-link {{'active' if request.endpoint=='dashboard' else ''}}" href="{{url_for('dashboard')}}"><span class="bf-ico">▦</span><span class="bf-side-label">Dashboard</span></a>{% endif %}
 {% if can('view_banks') or can('create_bank') %}<a class="bf-side-link {{'active' if request.endpoint in ('banks','update_bank_status') else ''}}" href="{{url_for('banks')}}"><span class="bf-ico">▤</span><span class="bf-side-label">Banks &amp; Dealers</span></a>{% endif %}
@@ -288,7 +310,7 @@ h3+.text-muted,h3+div.text-muted{margin-top:.1rem}
 <a class="bf-side-link {{'active' if request.endpoint=='manage_timezone' else ''}}" href="{{url_for('manage_timezone')}}" title="Business Timezone"><span class="bf-ico">◷</span><span class="bf-side-label">Business Timezone</span></a>
 <a class="bf-side-link {{'active' if request.endpoint=='clear_platform_settings' else ''}}" href="{{url_for('clear_platform_settings')}}" title="Clear Selected Platform"><span class="bf-ico">⚠</span><span class="bf-side-label">Clear Selected Platform</span></a>
 </div>{% endif %}
-</div><div class="bf-sidebar-bottom"><span class="bf-side-label small">{{current_user.username}} · {{current_user.role|title}}</span><a class="btn btn-outline-secondary btn-sm w-100" href="{{url_for('change_password')}}" title="Change password"><span class="bf-ico" aria-hidden="true">⚿</span><span class="bf-side-label">Change password</span></a><form method="post" action="{{url_for('logout')}}"><input type="hidden" name="csrf_token" value="{{csrf_token()}}"><button class="btn btn-outline-secondary btn-sm w-100" type="submit" title="Log out"><span class="bf-ico" aria-hidden="true">⎋</span><span class="bf-side-label">Log out</span></button></form></div></aside>{% endif %}
+</div></aside>{% endif %}
 {% if current_user.is_authenticated %}<div class="bf-backdrop" id="bf-backdrop"></div>{% endif %}<main class="container-fluid px-3 px-lg-4 py-4 bf-main" id="bf-content" tabindex="-1">
 <div class="bf-content-inner">
 {% with messages=get_flashed_messages(with_categories=true) %}{% for category,msg in messages %}<div class="alert alert-{{category}} shadow-sm" role="alert">{{msg}}</div>{% endfor %}{% endwith %}
@@ -431,6 +453,24 @@ h3+.text-muted,h3+div.text-muted{margin-top:.1rem}
   document.addEventListener('click',function(e){if(isOpen()&&!form.contains(e.target)) close(false);});
   window.addEventListener('pageshow',function(){name.textContent=cur();});
   form.classList.add('bf-pp-on'); form.append(btn,menu);
+})();
+</script>
+<script>
+(function(){
+  'use strict';
+  var btn=document.getElementById('bf-acct-btn'), menu=document.getElementById('bf-acct-menu'); if(!btn||!menu) return;
+  var items=function(){return [].slice.call(menu.querySelectorAll('[role="menuitem"]'));};
+  var open=function(){menu.hidden=false; btn.setAttribute('aria-expanded','true'); var f=items()[0]; if(f) f.focus({preventScroll:true});};
+  var close=function(refocus){menu.hidden=true; btn.setAttribute('aria-expanded','false'); if(refocus) btn.focus({preventScroll:true});};
+  btn.addEventListener('click',function(){menu.hidden?open():close(true);});
+  menu.addEventListener('keydown',function(e){
+    var it=items(), i=it.indexOf(document.activeElement);
+    if(e.key==='Escape'){e.preventDefault(); close(true);}
+    else if(e.key==='ArrowDown'){e.preventDefault(); it[(i+1)%it.length].focus();}
+    else if(e.key==='ArrowUp'){e.preventDefault(); it[(i-1+it.length)%it.length].focus();}
+    else if(e.key==='Tab'){close(false);}
+  });
+  document.addEventListener('click',function(e){if(!menu.hidden&&!btn.contains(e.target)&&!menu.contains(e.target)) close(false);});
 })();
 </script>
 </body></html>

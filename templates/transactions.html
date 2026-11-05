@@ -29,7 +29,7 @@
       <tbody>
       {% for t in records.items %}
         <tr class="{{'table-danger' if t.status=='voided' else ''}}" data-transaction-detail="tx-detail-{{t.id}}" style="cursor:pointer">
-          <td><div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} Business GMT</div>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span>{% endif %}</td>
+          <td>{% if pf_all %}<div class="mb-1">{{ pf_chip(t.platform_id) }}</div>{% endif %}<div class="fw-semibold">{{ t.customer_ref or '—' }}</div><div class="small text-muted font-monospace">{{ t.reference }}</div><div class="small text-muted">{{ t.created_at|mytime }} Business GMT</div>{% if t.status=='voided' %}<span class="badge bg-danger">DELETED</span>{% endif %}</td>
           <td><div>{{ transaction_banks.get(t.id, 'Unknown') }}</div>
             {% if t.kind in ('deposit','cash_in') %}<span class="badge bg-success">Deposit</span>
             {% elif t.kind in ('withdrawal','cash_out') %}<span class="badge bg-danger">Withdrawal</span>

@@ -13,6 +13,9 @@ bp = Blueprint('auto_closing_stage7', __name__, url_prefix='/admin/auto-closing'
 # Read-only Store-balance label for the New Transaction page (see store_balance.py).
 from store_balance import bp as _store_balance_bp  # noqa: E402
 bp.register_blueprint(_store_balance_bp)
+# Per-platform colours/badges for the admin All-Platforms view (see platform_badges.py).
+from platform_badges import bp as _platform_badges_bp  # noqa: E402
+bp.register_blueprint(_platform_badges_bp)
 
 
 def admin_only():

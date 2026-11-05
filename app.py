@@ -1768,7 +1768,59 @@ def create_app(test_config=None):
         for did,flow,aud,myr in rows:
             d=totals.setdefault(did,{'dealer_sell':Decimal('0'),'dealer_buy':Decimal('0'),'dealer_payout':Decimal('0'),'myr':Decimal('0')})
             d[flow]+=aud;d['myr']+=myr
-        return render_template('dealers.html',dealers=items,totals=totals)
+        trade_counts=dict(db.session.execute(select(DealerTrade.dealer_id,func.count(DealerTrade.id))
+            .where(DealerTrade.dealer_id.in_([d.id for d in items])).group_by(DealerTrade.dealer_id)).all()) if items else {}
+        return render_template('dealers.html',dealers=items,totals=totals,trade_counts=trade_counts)
+
+    @app.post('/dealers/<dealer_id>/delete')
+    @login_required
+    def delete_dealer(dealer_id):
+        """Permanently delete a dealer that has never been used. Dealers with history are kept for the ledger."""
+        require_permission('create_bank')
+        pid=require_single_platform()
+        try:
+            dealer=db.session.execute(select(Dealer).where(Dealer.id==dealer_id,Dealer.platform_id==pid).with_for_update()).scalar_one_or_none()
+            if not dealer: abort(404)
+            if DealerTrade.query.filter_by(dealer_id=dealer.id).first():
+                raise ValueError('This dealer has transaction history and cannot be deleted. Deactivate it instead.')
+            name=dealer.name
+            db.session.delete(dealer)
+            db.session.add(Audit(actor_id=current_user.id,action='DELETE_DEALER',detail=f'{dealer_id} {name}; platform={pid}'))
+            db.session.commit();flash(f'Dealer "{name}" deleted','success')
+        except ValueError as exc:
+            db.session.rollback();flash(str(exc),'danger')
+        except IntegrityError:
+            db.session.rollback();flash('Dealer is in use and cannot be deleted. Deactivate it instead.','danger')
+        return redirect(url_for('dealers'))
+
+    @app.post('/dealers/<dealer_id>/active')
+    @login_required
+    def set_dealer_active(dealer_id):
+        """Deactivate (hide from transaction forms) or reactivate a dealer; history and balances are untouched."""
+        require_permission('create_bank')
+        pid=require_single_platform()
+        make_active=request.form.get('active')=='1'
+        try:
+            dealer=db.session.execute(select(Dealer).where(Dealer.id==dealer_id,Dealer.platform_id==pid).with_for_update()).scalar_one_or_none()
+            if not dealer: abort(404)
+            if dealer.active!=make_active:
+                if not make_active:
+                    sell,buy,payout,myr=[Decimal('0')]*4
+                    for flow,aud,m in db.session.execute(select(DealerTrade.flow,func.sum(DealerTrade.aud_amount),func.sum(DealerTrade.myr_delta))
+                            .join(Transaction,Transaction.id==DealerTrade.transaction_id)
+                            .where(DealerTrade.dealer_id==dealer.id,Transaction.status=='confirmed').group_by(DealerTrade.flow)).all():
+                        myr+=m
+                        if flow=='dealer_sell': sell+=aud
+                        elif flow=='dealer_buy': buy+=aud
+                        else: payout+=aud
+                    if myr!=0 or sell-buy-payout!=0:
+                        raise ValueError('Settle this dealer\'s balance to zero before deactivating it.')
+                dealer.active=make_active
+                db.session.add(Audit(actor_id=current_user.id,action='REACTIVATE_DEALER' if make_active else 'DEACTIVATE_DEALER',detail=f'{dealer_id} {dealer.name}; platform={pid}'))
+                db.session.commit();flash(f'Dealer "{dealer.name}" {"reactivated" if make_active else "deactivated"}','success')
+        except ValueError as exc:
+            db.session.rollback();flash(str(exc),'danger')
+        return redirect(url_for('dealers'))
 
     @app.post('/transactions/check-reference')
     @login_required

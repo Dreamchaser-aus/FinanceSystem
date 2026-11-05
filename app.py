@@ -291,9 +291,10 @@ class Entry(db.Model):
 class Dealer(db.Model):
     platform_id=db.Column(db.String(36),db.ForeignKey("platform.id"),nullable=False,index=True)
     id=db.Column(db.String(36),primary_key=True,default=idgen)
-    name=db.Column(db.String(120),unique=True,nullable=False)
+    name=db.Column(db.String(120),nullable=False)
     active=db.Column(db.Boolean,nullable=False,default=True)
     created_at=db.Column(db.DateTime(timezone=True),default=now,nullable=False)
+    __table_args__=(UniqueConstraint('platform_id','name',name='uq_dealer_platform_name'),)
 
 class DealerTrade(db.Model):
     id=db.Column(db.String(36),primary_key=True,default=idgen)
@@ -1759,7 +1760,7 @@ def create_app(test_config=None):
                 try:
                     db.session.add(Dealer(name=name,platform_id=pid));db.session.commit();flash('Dealer added','success')
                 except IntegrityError:
-                    db.session.rollback();flash('Dealer already exists','danger')
+                    db.session.rollback();flash('Dealer already exists in this platform','danger')
             return redirect(url_for('banks'))
         items=Dealer.query.filter(platform_scope(Dealer)).order_by(Dealer.name).all()
         rows=db.session.execute(select(DealerTrade.dealer_id,DealerTrade.flow,func.sum(DealerTrade.aud_amount),func.sum(DealerTrade.myr_delta)).join(Transaction,Transaction.id==DealerTrade.transaction_id).where(Transaction.status=='confirmed',platform_scope(Transaction)).group_by(DealerTrade.dealer_id,DealerTrade.flow)).all()

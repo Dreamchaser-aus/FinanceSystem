@@ -11,17 +11,30 @@
 </div>
 </div>
 {% if staff_totals %}
+<style>
+.staff-summary-card{padding:.75rem!important}
+.staff-summary-values{display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem 1rem}
+.staff-summary-value{font-size:1.15rem;line-height:1.3;font-weight:700}
+</style>
 <div class="row g-2 mb-3">
   {% for title, (count, amount) in staff_totals.items() %}
-  <div class="col-12 col-sm-6">
-    <section class="card p-3 h-100">
-      <h5>Today’s {{ title }}</h5>
-      <strong class="fs-4 money">AUD {{ amount|rm }}</strong>
-      <strong class="fs-4 money">{{ count }} {{ 'transaction' if count == 1 else 'transactions' }}</strong>
-      <small class="text-muted">{{ entry_today }}</small>
+  <div class="col-12 col-md-4">
+    <section class="card staff-summary-card h-100">
+      <h5 class="fs-6 mb-1">{{ title }}</h5>
+      <div class="staff-summary-values">
+        <strong class="staff-summary-value money">AUD {{ amount|rm }}</strong>
+        <strong class="staff-summary-value">{{ count }} {{ 'transaction' if count == 1 else 'transactions' }}</strong>
+      </div>
     </section>
   </div>
   {% endfor %}
+  {% set net_sales = staff_totals['Deposit'][1] - staff_totals['Withdrawal'][1] %}
+  <div class="col-12 col-md-4">
+    <section class="card staff-summary-card h-100">
+      <h5 class="fs-6 mb-1">Net Sales</h5>
+      <strong class="staff-summary-value money {{ 'text-danger' if net_sales < 0 else 'text-success' }}">AUD {{ net_sales|rm }}</strong>
+    </section>
+  </div>
 </div>
 {% endif %}
 <div class="modal fade" id="newTransactionEntryModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="newTransactionEntryTitle" aria-hidden="true">
